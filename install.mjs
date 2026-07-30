@@ -146,6 +146,13 @@ function selfCheck() {
   // fixture itself must remain untouched by either call (mergeSettings is pure)
   assert.equal(fixture.hooks.PreToolUse.length, 1);
 
+  // edge case: settings object with no `hooks` key at all (the `if (!result.hooks)` branch)
+  const emptyMerged = mergeSettings({}, tmpHooksDir);
+  for (const event of HOOK_EVENTS) {
+    assert.equal(emptyMerged.hooks[event].length, 1);
+    assert.ok(emptyMerged.hooks[event][0].hooks[0].command.includes("glasshouse.mjs"));
+  }
+
   // writeConfig / copyHookScript, isolated in their own temp dir
   const tmpClaudeHome = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-selfcheck-"));
   try {
@@ -165,6 +172,17 @@ function selfCheck() {
     const copied = fs.readFileSync(path.join(tmpClaudeHome, "hooks", "glasshouse.mjs"), "utf8");
     const source = fs.readFileSync(path.join(repoRoot, "hooks", "glasshouse.mjs"), "utf8");
     assert.equal(copied, source);
+
+    // edge case: real first-run scenario — settings.json does not exist yet
+    const settingsPath = path.join(tmpClaudeHome, "settings.json");
+    assert.equal(fs.existsSync(settingsPath), false);
+    const installedHooksDir = path.join(tmpClaudeHome, "hooks");
+    const installed = installSettings(tmpClaudeHome, installedHooksDir);
+    for (const event of HOOK_EVENTS) {
+      assert.equal(installed.hooks[event].length, 1);
+    }
+    const onDisk = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    assert.deepStrictEqual(onDisk, installed);
   } finally {
     fs.rmSync(tmpClaudeHome, { recursive: true, force: true });
   }
