@@ -138,6 +138,29 @@ function claudeMdShareLevel(claudeMd) {
   return null;
 }
 
+// raw must never carry more than the row's own sanitized fields do — otherwise
+// it's a side channel that defeats consent-driven redaction/minimization.
+function sanitizeRaw(payload, eventName, consent) {
+  if (eventName === "InstructionsLoaded") {
+    const sanitized = { ...payload };
+    if (consent?.claudeMd !== "full") {
+      const redacted = redactClaudeMd(payload?.content ?? payload?.instructions ?? "");
+      if ("content" in sanitized) sanitized.content = redacted;
+      if ("instructions" in sanitized) sanitized.instructions = redacted;
+    }
+    return sanitized;
+  }
+  if (eventName === "PreToolUse") {
+    const sanitized = { ...payload };
+    if (sanitized.tool_input && typeof sanitized.tool_input === "object") {
+      sanitized.tool_input = { file_path: sanitized.tool_input.file_path ?? null };
+    }
+    return sanitized;
+  }
+  // SessionStart / SessionEnd / anything else: no content-bearing fields, passthrough.
+  return payload;
+}
+
 function buildRow({ eventName, payload, consent, config, settingsPath }) {
   const cwd = payload?.cwd ?? process.cwd();
   const row = {
@@ -149,7 +172,7 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
     cwd,
     git_branch: gitBranch(cwd),
     claude_md_share_level: claudeMdShareLevel(consent?.claudeMd),
-    raw: payload,
+    raw: sanitizeRaw(payload, eventName, consent),
     client_ts: new Date().toISOString(),
   };
 
@@ -352,6 +375,33 @@ function selfCheck() {
   assert.strictEqual(claudeMdShareLevel("full"), "full");
   assert.strictEqual(claudeMdShareLevel("redacted"), "redacted");
   assert.strictEqual(claudeMdShareLevel("none"), null);
+
+  // raw must not be a side channel around redaction: InstructionsLoaded + "redacted"
+  // consent must not leak the un-redacted body via row.raw.content.
+  const bodyText = "this is proprietary body text that must never leave the machine";
+  const instructionsRow = buildRow({
+    eventName: "InstructionsLoaded",
+    payload: { content: `# Heading\n${bodyText}`, cwd: "/tmp/x" },
+    consent: { claudeMd: "redacted", activity: "no" },
+    config: {},
+    settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+  });
+  assert.strictEqual(instructionsRow.raw.content.includes(bodyText), false);
+  assert.strictEqual(instructionsRow.raw.content, instructionsRow.content);
+
+  // PreToolUse: raw.tool_input must be stripped to file_path only.
+  const preToolRow = buildRow({
+    eventName: "PreToolUse",
+    payload: {
+      cwd: "/tmp/x",
+      tool_name: "Write",
+      tool_input: { file_path: "/tmp/x/secret.txt", content: "top secret file contents" },
+    },
+    consent: { claudeMd: "none", activity: "yes" },
+    config: {},
+    settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+  });
+  assert.deepStrictEqual(Object.keys(preToolRow.raw.tool_input), ["file_path"]);
 
   console.log("OK");
   process.exit(0);
