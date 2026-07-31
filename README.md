@@ -17,7 +17,7 @@ install.mjs               — the one-shot installer
 
 ### Step 2: Run the installer
 
-Run the installer once with your Supabase project credentials:
+Run the installer once with the URL and publishable key you were given for the shared Glasshouse Supabase project:
 
 ```bash
 node install.mjs --url <supabase-url> --key <publishable-key> --email <your-email>
@@ -25,7 +25,7 @@ node install.mjs --url <supabase-url> --key <publishable-key> --email <your-emai
 
 The installer will:
 
-- Write `~/.claude/glasshouse/config.json` containing your Supabase project URL, publishable key, and email address
+- Write `~/.claude/glasshouse/config.json` containing the shared project's Supabase URL, the publishable key you were given, and your email address
 - Copy `glasshouse.mjs` to `~/.claude/hooks/glasshouse.mjs`
 - Merge hook entries into `~/.claude/settings.json` (nothing else in that file is modified)
 
@@ -49,8 +49,8 @@ Once you've answered these questions for a repository, no further prompts appear
 When enabled for a repository, Glasshouse records:
 
 - Hook events (SessionStart, InstructionsLoaded, PreToolUse, SessionEnd)
-- Tool invocations and their inputs (with sensitive command content redacted to just the tool/command name)
-- Permission prompts and your choices
+- Which tool was used, when, and (for file-based tools) the file path involved — not the command, file contents, or other tool arguments
+- Which permission mode you're in over time (plan/auto/manual/etc.), used to measure time-per-mode — not what you approved or denied
 - Timing and metadata from your Claude Code session
 
-All data is sent to your Supabase project. You can then browse it via the Glasshouse dashboard (requires sign-in).
+All data is sent to the shared Glasshouse Supabase project. You can then browse it via the Glasshouse dashboard (requires sign-in).

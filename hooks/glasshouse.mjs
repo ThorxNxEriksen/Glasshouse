@@ -141,24 +141,33 @@ function claudeMdShareLevel(claudeMd) {
 // raw must never carry more than the row's own sanitized fields do — otherwise
 // it's a side channel that defeats consent-driven redaction/minimization.
 function sanitizeRaw(payload, eventName, consent) {
+  let sanitized;
   if (eventName === "InstructionsLoaded") {
-    const sanitized = { ...payload };
+    sanitized = { ...payload };
     if (consent?.claudeMd !== "full") {
       const redacted = redactClaudeMd(payload?.content ?? payload?.instructions ?? "");
       if ("content" in sanitized) sanitized.content = redacted;
       if ("instructions" in sanitized) sanitized.instructions = redacted;
     }
-    return sanitized;
-  }
-  if (eventName === "PreToolUse") {
-    const sanitized = { ...payload };
+  } else if (eventName === "PreToolUse") {
+    sanitized = { ...payload };
     if (sanitized.tool_input && typeof sanitized.tool_input === "object") {
       sanitized.tool_input = { file_path: sanitized.tool_input.file_path ?? null };
     }
-    return sanitized;
+  } else {
+    // SessionStart / SessionEnd / anything else: no content-bearing fields, passthrough (copied).
+    sanitized = { ...payload };
   }
-  // SessionStart / SessionEnd / anything else: no content-bearing fields, passthrough.
-  return payload;
+
+  // transcript_path/prompt_id are local filesystem paths (containing the OS
+  // username) / session identifiers that leak regardless of any consent choice.
+  delete sanitized.transcript_path;
+  delete sanitized.prompt_id;
+  // permission_mode is part of "activity sharing" consent (see buildRow) — must
+  // not survive into raw as a side channel when the user opted out of it.
+  if (consent?.activity !== "yes") sanitized.permission_mode = null;
+
+  return sanitized;
 }
 
 function buildRow({ eventName, payload, consent, config, settingsPath }) {
@@ -168,7 +177,9 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
     user_email: config?.userEmail ?? null,
     hostname: os.hostname(),
     hook_event_name: eventName,
-    permission_mode: payload?.permission_mode ?? null,
+    // permission_mode is gated on activity consent, same as tool/skill/MCP usage —
+    // the consent flow presents them as one "activity sharing" choice.
+    permission_mode: consent?.activity === "yes" ? (payload?.permission_mode ?? null) : null,
     cwd,
     git_branch: gitBranch(cwd),
     claude_md_share_level: claudeMdShareLevel(consent?.claudeMd),
@@ -402,6 +413,39 @@ function selfCheck() {
     settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
   });
   assert.deepStrictEqual(Object.keys(preToolRow.raw.tool_input), ["file_path"]);
+
+  // permission_mode is gated on activity consent ("activity sharing" covers both
+  // tool/skill/MCP usage AND permission-mode timing) — activity !== "yes" must
+  // null it out in row.permission_mode AND in row.raw (no side-channel leak).
+  const noActivityRow = buildRow({
+    eventName: "SessionStart",
+    payload: { cwd: "/tmp/x", permission_mode: "plan" },
+    consent: { claudeMd: "none", activity: "no" },
+    config: {},
+    settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+  });
+  assert.strictEqual(noActivityRow.permission_mode, null);
+  assert.strictEqual(noActivityRow.raw.permission_mode, null);
+
+  // transcript_path/prompt_id (local filesystem paths / identifiers) must never
+  // survive into raw, on every sanitizeRaw branch.
+  for (const eventName of ["SessionStart", "SessionEnd", "InstructionsLoaded", "PreToolUse"]) {
+    const leakRow = buildRow({
+      eventName,
+      payload: {
+        cwd: "/tmp/x",
+        transcript_path: "C:/Users/thor/.claude/transcript.jsonl",
+        prompt_id: "prompt-123",
+        content: "# H\nbody",
+        tool_input: { file_path: "/tmp/x/f.txt" },
+      },
+      consent: { claudeMd: "full", activity: "yes" },
+      config: {},
+      settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+    });
+    assert.strictEqual("transcript_path" in leakRow.raw, false);
+    assert.strictEqual("prompt_id" in leakRow.raw, false);
+  }
 
   console.log("OK");
   process.exit(0);

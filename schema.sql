@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS claude_events (
 -- Enable Row Level Security
 ALTER TABLE claude_events ENABLE ROW LEVEL SECURITY;
 
+-- Explicit grants: don't rely on Supabase's implicit default grants to
+-- public-schema objects, which Supabase has signaled it may stop doing.
+REVOKE ALL ON claude_events FROM anon, authenticated;
+GRANT INSERT ON claude_events TO anon;
+GRANT SELECT ON claude_events TO authenticated;
+
 -- Policy: anon can only insert
 CREATE POLICY "anon_insert_only" ON claude_events
   FOR INSERT TO anon
@@ -37,7 +43,11 @@ CREATE POLICY "authenticated_select_only" ON claude_events
   USING (true);
 
 -- View 1: claude_md_session - InstructionsLoaded rows
-CREATE OR REPLACE VIEW claude_md_session AS
+-- security_invoker: views default to running as their creator, which bypasses
+-- claude_events' RLS entirely. Without it, the anon key (public/distributed)
+-- could read the whole dataset through the view even though the base table
+-- restricts anon to INSERT only.
+CREATE OR REPLACE VIEW claude_md_session WITH (security_invoker = true) AS
 SELECT
   session_id,
   hostname,
@@ -50,10 +60,11 @@ SELECT
 FROM claude_events
 WHERE hook_event_name = 'InstructionsLoaded';
 
+REVOKE ALL ON claude_md_session FROM anon;
 GRANT SELECT ON claude_md_session TO authenticated;
 
 -- View 2: session_hooks_installed - SessionStart rows with non-null installed_hooks
-CREATE OR REPLACE VIEW session_hooks_installed AS
+CREATE OR REPLACE VIEW session_hooks_installed WITH (security_invoker = true) AS
 SELECT
   session_id,
   hostname,
@@ -64,10 +75,11 @@ FROM claude_events
 WHERE hook_event_name = 'SessionStart'
   AND installed_hooks IS NOT NULL;
 
+REVOKE ALL ON session_hooks_installed FROM anon;
 GRANT SELECT ON session_hooks_installed TO authenticated;
 
 -- View 3: permission_mode_summary - duration of permission modes per session
-CREATE OR REPLACE VIEW permission_mode_summary AS
+CREATE OR REPLACE VIEW permission_mode_summary WITH (security_invoker = true) AS
 WITH windowed AS (
   SELECT
     session_id,
@@ -86,10 +98,11 @@ WHERE permission_mode IS NOT NULL
   AND next_ts IS NOT NULL
 GROUP BY session_id, permission_mode;
 
+REVOKE ALL ON permission_mode_summary FROM anon;
 GRANT SELECT ON permission_mode_summary TO authenticated;
 
 -- View 4: session_tool_usage - PreToolUse rows with non-null tool_name
-CREATE OR REPLACE VIEW session_tool_usage AS
+CREATE OR REPLACE VIEW session_tool_usage WITH (security_invoker = true) AS
 SELECT
   session_id,
   tool_name,
@@ -101,4 +114,5 @@ WHERE hook_event_name = 'PreToolUse'
   AND tool_name IS NOT NULL
 GROUP BY session_id, tool_name;
 
+REVOKE ALL ON session_tool_usage FROM anon;
 GRANT SELECT ON session_tool_usage TO authenticated;
