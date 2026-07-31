@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { getSupabaseClient } from "../../lib/supabaseClient";
+import { ViewSection } from "../../components/ViewSection";
 
 const VIEW_NAMES = [
   "claude_md_session",
@@ -10,36 +11,6 @@ const VIEW_NAMES = [
   "permission_mode_summary",
   "session_tool_usage",
 ] as const;
-
-function ViewSection({ viewName }: { viewName: string }) {
-  const [rows, setRows] = useState<Record<string, unknown>[] | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    getSupabaseClient()
-      .from(viewName)
-      .select("*")
-      .limit(20)
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        setRows(!error && data && data.length > 0 ? data : []);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [viewName]);
-
-  return (
-    <section>
-      <h2>{viewName}</h2>
-      {rows === null || rows.length === 0 ? (
-        <p>No data yet.</p>
-      ) : (
-        <pre>{JSON.stringify(rows, null, 2)}</pre>
-      )}
-    </section>
-  );
-}
 
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
