@@ -294,7 +294,11 @@ async function runHookMode() {
   } catch {
     // a hook must never crash a real session
   } finally {
-    process.exit(0);
+    // Deferred via setImmediate: exiting synchronously in the same tick a
+    // fetch() resolves races undici's socket-handle cleanup on Windows,
+    // tripping libuv's "!(handle->flags & UV_HANDLE_CLOSING)" assertion in
+    // async.c. Deferring to the next tick lets that cleanup finish first.
+    setImmediate(() => process.exit(0));
   }
 }
 
