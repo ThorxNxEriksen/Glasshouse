@@ -1,0 +1,263 @@
+/* ============================================================
+   Intellishore design-system tokens + component styles, ported
+   from the "Agent Glassdoor" Claude Design mock for this route only.
+   Source: claude.ai/design project 456c8123-11e2-4104-875b-cc9fc485b3ea,
+   _ds/intellishore-design-system-.../{tokens/*.css,styles.css} + component
+   CSS strings from _ds_bundle.js (Badge/Button/Card/StatBlock/Tag/Avatar).
+   ESPeak (the brand display face) isn't vendored here — font-family falls
+   through to the documented fallback stack below.
+   ============================================================ */
+
+.profile-ds {
+  /* ---- Brand: Petrol ---- */
+  --petrol-900: #0e2b2b;
+  --petrol-800: #143838;
+  --petrol-700: #184848;
+  --petrol-100: #e6f0ef;
+  --petrol-050: #f3f8f7;
+
+  /* ---- Brand: Teal/Sky ---- */
+  --teal-700: #1f6e92;
+  --teal-600: #2a82ac;
+  --teal-500: #3090c0;
+  --teal-400: #48a8d8;
+  --teal-100: #dceef6;
+  --teal-050: #f0f8fb;
+
+  /* ---- Accent: Lavender ---- */
+  --lavender-600: #7e76a8;
+  --lavender-500: #9c92c2;
+  --lavender-100: #eeebf5;
+
+  /* ---- Neutrals ---- */
+  --ink-900: #14201f;
+  --ink-700: #3b4948;
+  --grey-500: #6d696d;
+  --grey-400: #8e9694;
+  --grey-300: #b6bdbc;
+  --grey-200: #d7dcdb;
+  --grey-150: #e6e9e8;
+  --grey-100: #f0f2f1;
+  --grey-050: #f7f8f8;
+
+  /* ---- Semantic status ---- */
+  --success: #2e8b6e;
+  --success-soft: #e4f2ec;
+  --warning: #c98a2b;
+  --warning-soft: #f8eedc;
+  --danger: #c0533f;
+  --danger-soft: #f6e6e1;
+
+  /* ---- Semantic aliases ---- */
+  --surface-page: var(--grey-050);
+  --surface-card: #fff;
+  --surface-sunken: var(--grey-100);
+  --surface-tint: var(--teal-050);
+  --text-strong: var(--ink-900);
+  --text-body: var(--ink-700);
+  --text-muted: var(--grey-500);
+  --text-faint: var(--grey-400);
+  --text-link: var(--teal-600);
+  --brand: var(--petrol-700);
+  --brand-accent: var(--teal-500);
+  --interactive: var(--teal-600);
+  --interactive-hover: var(--teal-700);
+  --border-subtle: var(--grey-150);
+  --border-default: var(--grey-200);
+  --border-strong: var(--grey-300);
+  --focus-ring: var(--teal-400);
+
+  /* ---- Type ---- */
+  --font-display: "ESPeak", "Helvetica Neue", system-ui, sans-serif;
+  --font-body: "ESPeak", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", ui-monospace, "Menlo", monospace;
+  --weight-thin: 100;
+  --weight-regular: 400;
+  --weight-bold: 700;
+  --text-display-md: 48px;
+  --text-h2: 30px;
+  --text-h4: 20px;
+  --text-lg: 18px;
+  --text-base: 16px;
+  --text-sm: 14px;
+  --text-xs: 13px;
+  --text-2xs: 11px;
+  --leading-body: 1.6;
+  --leading-snug: 1.18;
+  --tracking-display: -0.02em;
+  --tracking-eyebrow: 0.16em;
+
+  /* ---- Spacing / radius / shadow / motion ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --radius-xs: 3px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-card: var(--radius-md);
+  --radius-pill: 999px;
+  --border-width-strong: 1.5px;
+  --shadow-sm: 0 1px 3px rgba(20, 32, 31, 0.06), 0 1px 2px rgba(20, 32, 31, 0.04);
+  --shadow-md: 0 4px 14px rgba(20, 40, 40, 0.07), 0 2px 5px rgba(20, 40, 40, 0.05);
+  --shadow-lg: 0 12px 32px rgba(14, 43, 43, 0.1), 0 4px 10px rgba(14, 43, 43, 0.05);
+  --shadow-xl: 0 28px 60px rgba(14, 43, 43, 0.14);
+  --shadow-focus: 0 0 0 3px rgba(72, 168, 216, 0.35);
+  --ease-standard: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+
+  font-family: var(--font-body);
+  font-weight: var(--weight-regular);
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  color: var(--text-body);
+  background: var(--surface-page);
+  min-height: 100vh;
+}
+
+.profile-ds h1,
+.profile-ds h2,
+.profile-ds h3,
+.profile-ds h4 {
+  margin: 0;
+  color: var(--text-strong);
+  font-family: var(--font-display);
+  font-weight: var(--weight-regular);
+}
+
+.profile-ds a {
+  color: var(--text-link);
+  text-decoration: none;
+  transition: color var(--duration-fast) var(--ease-standard);
+}
+.profile-ds a:hover {
+  color: var(--interactive-hover);
+}
+
+.profile-ds :focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ---- Badge ---- */
+.is-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: var(--weight-bold);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.04em;
+  line-height: 1;
+  padding: 5px 10px;
+  border-radius: var(--radius-xs);
+  text-transform: uppercase;
+  background: var(--grey-100);
+  color: var(--ink-700);
+}
+.is-badge--neutral { background: var(--grey-100); color: var(--ink-700); }
+.is-badge--brand { background: var(--petrol-100); color: var(--petrol-700); }
+.is-badge--accent { background: var(--teal-100); color: var(--teal-700); }
+.is-badge--success { background: var(--success-soft); color: var(--success); }
+.is-badge--warning { background: var(--warning-soft); color: var(--warning); }
+.is-badge--solid { background: var(--petrol-700); color: #fff; }
+
+/* ---- Button ---- */
+.is-btn {
+  --_bg: var(--interactive);
+  --_bgh: var(--interactive-hover);
+  --_fg: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-sm);
+  letter-spacing: 0.01em;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  border: var(--border-width-strong) solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--_bg);
+  color: var(--_fg);
+  padding: 0 var(--space-5);
+  height: 44px;
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+.is-btn:hover { background: var(--_bgh); }
+.is-btn:active { transform: translateY(1px); }
+.is-btn:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
+.is-btn--sm { height: 36px; font-size: var(--text-xs); padding: 0 var(--space-4); }
+.is-btn--ghost { --_bg: transparent; --_bgh: var(--grey-100); --_fg: var(--text-body); }
+
+/* ---- Card ---- */
+.is-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  padding: var(--space-6);
+  color: var(--text-body);
+  transition: box-shadow var(--duration-base) var(--ease-standard),
+    transform var(--duration-base) var(--ease-standard),
+    border-color var(--duration-base) var(--ease-standard);
+}
+.is-card--tint { background: var(--surface-tint); border-color: transparent; }
+.is-card--interactive { cursor: pointer; }
+.is-card--interactive:hover {
+  box-shadow: var(--shadow-lg);
+  transform: translateY(-3px);
+  border-color: transparent;
+}
+
+/* ---- StatBlock ---- */
+.is-stat { display: flex; flex-direction: column; gap: var(--space-2); }
+.is-stat__value {
+  font-family: var(--font-display);
+  font-weight: var(--weight-thin);
+  font-size: var(--text-display-md);
+  line-height: 1;
+  letter-spacing: var(--tracking-display);
+  color: var(--text-strong);
+}
+.is-stat__label { font-size: var(--text-sm); color: var(--text-muted); line-height: var(--leading-snug); max-width: 22ch; }
+
+/* ---- Tag ---- */
+.is-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: var(--weight-regular);
+  font-size: var(--text-sm);
+  line-height: 1;
+  color: var(--text-body);
+  background: var(--surface-card);
+  border: 1px solid var(--border-default);
+  padding: 7px 12px;
+  border-radius: var(--radius-pill);
+  transition: border-color var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard);
+}
+.is-tag--interactive { cursor: pointer; }
+.is-tag--interactive:hover { border-color: var(--teal-400); color: var(--text-strong); }
+
+/* ---- Avatar ---- */
+.is-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--petrol-100);
+  color: var(--petrol-700);
+  font-weight: var(--weight-bold);
+  font-size: var(--text-sm);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.is-avatar--lg { width: 56px; height: 56px; font-size: var(--text-lg); }
