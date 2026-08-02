@@ -31,11 +31,18 @@ function writeConfig(claudeHome, config) {
   fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify(config, null, 2) + "\n");
 }
 
+function buildConfig({ email, url, key }) {
+  const config = { userEmail: email };
+  if (url) config.supabaseUrl = url;
+  if (key) config.supabasePublishableKey = key;
+  return config;
+}
+
 function copyHookScript(repoRoot, claudeHome) {
   const hooksDir = path.join(claudeHome, "hooks");
   fs.mkdirSync(hooksDir, { recursive: true });
   fs.copyFileSync(
-    path.join(repoRoot, "hooks", "glasshouse.mjs"),
+    path.join(repoRoot, "glasshouse-plugin", "glasshouse.mjs"),
     path.join(hooksDir, "glasshouse.mjs")
   );
   return hooksDir;
@@ -153,6 +160,13 @@ function selfCheck() {
     assert.ok(emptyMerged.hooks[event][0].hooks[0].command.includes("glasshouse.mjs"));
   }
 
+  // buildConfig: email-only by default, url/key included only when given.
+  assert.deepStrictEqual(buildConfig({ email: "a@example.com" }), { userEmail: "a@example.com" });
+  assert.deepStrictEqual(
+    buildConfig({ email: "a@example.com", url: "https://x", key: "k" }),
+    { userEmail: "a@example.com", supabaseUrl: "https://x", supabasePublishableKey: "k" },
+  );
+
   // writeConfig / copyHookScript, isolated in their own temp dir
   const tmpClaudeHome = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-selfcheck-"));
   try {
@@ -170,7 +184,7 @@ function selfCheck() {
     const repoRoot = path.dirname(fileURLToPath(import.meta.url));
     copyHookScript(repoRoot, tmpClaudeHome);
     const copied = fs.readFileSync(path.join(tmpClaudeHome, "hooks", "glasshouse.mjs"), "utf8");
-    const source = fs.readFileSync(path.join(repoRoot, "hooks", "glasshouse.mjs"), "utf8");
+    const source = fs.readFileSync(path.join(repoRoot, "glasshouse-plugin", "glasshouse.mjs"), "utf8");
     assert.equal(copied, source);
 
     // edge case: real first-run scenario — settings.json does not exist yet
@@ -200,23 +214,12 @@ function main() {
   }
 
   const args = parseArgs(argv);
-  if (!args.url || !args.key) {
-    process.stderr.write(
-      "Usage: node install.mjs --url <supabase-url> --key <publishable-key> [--email <email>]\n"
-    );
-    process.exit(1);
-    return;
-  }
   const email = args.email !== undefined ? args.email : getDefaultEmail();
 
   const claudeHome = path.join(os.homedir(), ".claude");
   const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
-  writeConfig(claudeHome, {
-    supabaseUrl: args.url,
-    supabasePublishableKey: args.key,
-    userEmail: email,
-  });
+  writeConfig(claudeHome, buildConfig({ email, url: args.url, key: args.key }));
   const hooksDir = copyHookScript(repoRoot, claudeHome);
   installSettings(claudeHome, hooksDir);
   console.log("Glasshouse installed.");

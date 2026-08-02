@@ -4,8 +4,11 @@
 // Invocation shapes (dispatched on process.argv):
 //   node glasshouse.mjs                → hook mode (reads a Claude Code hook payload from stdin)
 //   node glasshouse.mjs consent ...    → consent CLI (writes ~/.claude/glasshouse/consent.json)
+//   node glasshouse.mjs set-email ...  → writes ~/.claude/glasshouse/config.json
 //   node glasshouse.mjs --self-check   → offline self-check, never touches real files/network
 //
+// Ships as the Claude Code plugin's hook script (${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs)
+// and is also usable standalone via install.mjs for local development.
 // See PLAN.md at the repo root for the full design this implements.
 
 import fs from "node:fs";
@@ -13,6 +16,11 @@ import path from "node:path";
 import os from "node:os";
 import assert from "node:assert";
 import { execFileSync } from "node:child_process";
+
+// Shared Glasshouse Supabase project — the publishable key is designed to be
+// public (insert-only RLS on claude_events; it cannot read anything back).
+const SUPABASE_URL = "https://smzccpjmakavoxlsrvku.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_ls0imoJ332Zpd-IeehbWkg_X6Q-w8Um";
 
 // ---------------------------------------------------------------------------
 // Consent store — ~/.claude/glasshouse/consent.json, but every function here
@@ -53,12 +61,26 @@ function saveConsentStore(baseDir, store) {
 function loadConfig(baseDir) {
   try {
     const data = JSON.parse(fs.readFileSync(configPath(baseDir), "utf8"));
-    if (data && typeof data === "object" && data.supabaseUrl && data.supabasePublishableKey) {
-      return data;
+    if (!data || typeof data !== "object" || typeof data.userEmail !== "string" || !data.userEmail) {
+      return null;
     }
-    return null;
+    return {
+      supabaseUrl: data.supabaseUrl || SUPABASE_URL,
+      supabasePublishableKey: data.supabasePublishableKey || SUPABASE_PUBLISHABLE_KEY,
+      userEmail: data.userEmail,
+    };
   } catch {
     return null;
+  }
+}
+
+function saveConfig(baseDir, config) {
+  try {
+    fs.mkdirSync(glasshouseDir(baseDir), { recursive: true });
+    fs.writeFileSync(configPath(baseDir), JSON.stringify(config, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -260,8 +282,20 @@ async function runHookMode() {
     const consent = loadConsentStore(homeDir)[repoKey];
 
     if (eventName === "SessionStart") {
-      if (!consent) {
-        const hookPath = String(process.argv[1] ?? "").split(path.sep).join("/");
+      const config = loadConfig(homeDir);
+      const hookPath = String(process.argv[1] ?? "").split(path.sep).join("/");
+      if (!config) {
+        const text =
+          `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
+          `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
+          `data, then run: node "${hookPath}" set-email --email "<email>". ` +
+          `Nothing is sent anywhere until that command runs.`;
+        process.stdout.write(
+          JSON.stringify({
+            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
+          }) + "\n",
+        );
+      } else if (!consent) {
         const text =
           `Glasshouse usage analytics has no sharing preference on file for this repo yet. ` +
           `Ask the user via AskUserQuestion, exactly two questions: ` +
@@ -294,11 +328,13 @@ async function runHookMode() {
   } catch {
     // a hook must never crash a real session
   } finally {
-    // Deferred via setImmediate: exiting synchronously in the same tick a
-    // fetch() resolves races undici's socket-handle cleanup on Windows,
-    // tripping libuv's "!(handle->flags & UV_HANDLE_CLOSING)" assertion in
-    // async.c. Deferring to the next tick lets that cleanup finish first.
-    setImmediate(() => process.exit(0));
+    // setTimeout(0), not setImmediate: exiting while a fetch()'s socket is
+    // still being torn down races undici's cleanup on Windows, tripping
+    // libuv's "!(handle->flags & UV_HANDLE_CLOSING)" assertion in async.c.
+    // setImmediate fires in libuv's "check" phase, which runs BEFORE "close
+    // callbacks" in the same loop iteration — too early. setTimeout(0) defers
+    // to a later iteration's timers phase, after close callbacks have run.
+    setTimeout(() => process.exit(0), 0);
   }
 }
 
@@ -342,6 +378,18 @@ function runConsentMode(argv) {
   process.exit(0);
 }
 
+function runSetEmailMode(argv) {
+  const flags = parseFlags(argv);
+  const email = flags.email;
+  if (!email) {
+    process.stderr.write('Usage: glasshouse.mjs set-email --email "<email>"\n');
+    process.exit(1);
+    return;
+  }
+  saveConfig(os.homedir(), { userEmail: email });
+  process.exit(0);
+}
+
 // ---------------------------------------------------------------------------
 // Self-check — assert-based, no network calls, no real files touched.
 // ---------------------------------------------------------------------------
@@ -364,6 +412,26 @@ function selfCheck() {
     // loadConsentStore/loadConfig: missing file never throws.
     assert.deepStrictEqual(loadConsentStore(tmpDir), {});
     assert.strictEqual(loadConfig(tmpDir), null);
+
+    // loadConfig/saveConfig: embedded Supabase constants fill in when
+    // config.json only has userEmail; an explicit supabaseUrl/
+    // supabasePublishableKey (local-dev override) still wins.
+    saveConfig(tmpDir, { userEmail: "a@example.com" });
+    assert.deepStrictEqual(loadConfig(tmpDir), {
+      supabaseUrl: SUPABASE_URL,
+      supabasePublishableKey: SUPABASE_PUBLISHABLE_KEY,
+      userEmail: "a@example.com",
+    });
+    saveConfig(tmpDir, {
+      userEmail: "b@example.com",
+      supabaseUrl: "https://test.local",
+      supabasePublishableKey: "pk_test",
+    });
+    assert.deepStrictEqual(loadConfig(tmpDir), {
+      supabaseUrl: "https://test.local",
+      supabasePublishableKey: "pk_test",
+      userEmail: "b@example.com",
+    });
 
     // readInstalledHooks: fixture returns matchers only, never command strings.
     const settingsPath = path.join(tmpDir, "settings.json");
@@ -465,6 +533,8 @@ if (mode === "--self-check") {
   selfCheck();
 } else if (mode === "consent") {
   runConsentMode(process.argv.slice(3));
+} else if (mode === "set-email") {
+  runSetEmailMode(process.argv.slice(3));
 } else {
   runHookMode();
 }
