@@ -15,7 +15,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import assert from "node:assert";
-import { execFileSync } from "node:child_process";
+import http from "node:http";
+import https from "node:https";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 // Shared Glasshouse Supabase project — the publishable key is designed to be
 // public (insert-only RLS on claude_events; it cannot read anything back).
@@ -229,28 +232,59 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
 // Fire-and-forget POST
 // ---------------------------------------------------------------------------
 
-async function postEvent(config, row) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1200);
-    try {
-      await fetch(`${config.supabaseUrl}/rest/v1/claude_events`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: config.supabasePublishableKey,
-          Authorization: `Bearer ${config.supabasePublishableKey}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify(row),
-        signal: controller.signal,
-      });
-    } finally {
+// node:https, not fetch(). fetch() leaves undici's connection pool holding the
+// event loop after the request settles, which is why this used to end in
+// process.exit() — and exiting mid-teardown is what tripped libuv's
+// "!(handle->flags & UV_HANDLE_CLOSING)" assertion in async.c on Windows,
+// aborting the hook on every single tool call. AbortController is no help
+// either: it rejects the promise but leaves a connecting socket open, so an
+// unreachable host stalled the hook ~11s. A plain request with agent:false has
+// no keep-alive to leak and req.destroy() genuinely cancels, so the loop drains
+// on its own and nobody has to call process.exit() at all.
+function postEvent(config, row) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      resolve();
+    };
+
+    try {
+      const body = JSON.stringify(row);
+      const url = `${config.supabaseUrl}/rest/v1/claude_events`;
+      const req = (url.startsWith("http://") ? http : https).request(
+        url,
+        {
+          method: "POST",
+          agent: false,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            apikey: config.supabasePublishableKey,
+            Authorization: `Bearer ${config.supabasePublishableKey}`,
+            Prefer: "return=minimal",
+          },
+        },
+        (res) => {
+          res.resume(); // drain, or the socket never closes
+          res.on("end", finish);
+        },
+      );
+      // network failure, non-2xx, malformed URL — no retry, no buffering.
+      req.on("error", finish);
+      req.on("close", finish);
+      timer = setTimeout(() => {
+        req.destroy();
+        finish();
+      }, 1200);
+      req.end(body);
+    } catch {
+      finish();
     }
-  } catch {
-    // network failure, abort, non-2xx — no retry, no buffering.
-  }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +298,11 @@ async function sendIfConsented(eventName, payload, consent, homeDir, settingsPat
   await postEvent(config, row);
 }
 
+// Ends by simply returning — no forced exit, deliberately. Tearing the process
+// down while the HTTP socket was still closing is what aborted this hook on
+// Windows (see postEvent). Everything below is either synchronous or bounded by
+// postEvent's 1200ms timeout, so the event loop drains on its own. selfCheck
+// asserts this function never regains a forced exit.
 async function runHookMode() {
   try {
     let payload = {};
@@ -327,14 +366,6 @@ async function runHookMode() {
     // any other event: no-op
   } catch {
     // a hook must never crash a real session
-  } finally {
-    // setTimeout(0), not setImmediate: exiting while a fetch()'s socket is
-    // still being torn down races undici's cleanup on Windows, tripping
-    // libuv's "!(handle->flags & UV_HANDLE_CLOSING)" assertion in async.c.
-    // setImmediate fires in libuv's "check" phase, which runs BEFORE "close
-    // callbacks" in the same loop iteration — too early. setTimeout(0) defers
-    // to a later iteration's timers phase, after close callbacks have run.
-    setTimeout(() => process.exit(0), 0);
   }
 }
 
@@ -394,7 +425,7 @@ function runSetEmailMode(argv) {
 // Self-check — assert-based, no network calls, no real files touched.
 // ---------------------------------------------------------------------------
 
-function selfCheck() {
+async function selfCheck() {
   // redactClaudeMd: keeps headings only, appends exact omitted-count line.
   const content = "# Title\nSome body text\n## Sub\nMore text here";
   const expected = [
@@ -519,8 +550,95 @@ function selfCheck() {
     assert.strictEqual("prompt_id" in leakRow.raw, false);
   }
 
+  // The Windows libuv abort ("!(handle->flags & UV_HANDLE_CLOSING)") that used
+  // to fire on every tool call cannot be reproduced offline — it needs a real
+  // remote socket. Loopback servers that answer instantly, answer slowly, or
+  // never answer all pass even against the old fetch()+process.exit() code, so
+  // no self-contained test catches it. Assert the invariant itself instead.
+  const noForcedExit = "must not force a process exit — it is what tripped the libuv abort on Windows";
+  assert.ok(!runHookMode.toString().includes("process.exit"), `runHookMode ${noForcedExit}`);
+  assert.ok(!postEvent.toString().includes("process.exit"), `postEvent ${noForcedExit}`);
+  // fetch()'s connection pool outlives the request, which is the only reason a
+  // forced exit ever seemed necessary. Keep postEvent on node:http/https.
+  assert.ok(!postEvent.toString().includes("fetch("), "postEvent must not use fetch() — see its comment");
+
+  await assertHookModePostsAndExits();
+
   console.log("OK");
-  process.exit(0);
+}
+
+// End-to-end smoke test of hook mode: spawns the real thing with a piped stdin
+// (how Claude Code invokes it) against a loopback server, with HOME redirected
+// at a temp dir so the user's own consent/config are never read. Covers "runs,
+// honours consent, posts exactly one row, exits 0" — NOT the libuv abort above,
+// which loopback cannot trigger. Loopback only — no outbound network.
+function assertHookModePostsAndExits() {
+  return new Promise((resolve, reject) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-exitcheck-"));
+    let received = 0;
+
+    const server = http.createServer((req, res) => {
+      received++;
+      req.resume();
+      res.writeHead(201).end();
+    });
+
+    const cleanup = () => {
+      server.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    };
+
+    server.listen(0, "127.0.0.1", () => {
+      const dir = glasshouseDir(tmpDir);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        configPath(tmpDir),
+        JSON.stringify({
+          supabaseUrl: `http://127.0.0.1:${server.address().port}`,
+          supabasePublishableKey: "selfcheck-key",
+          userEmail: "selfcheck@example.invalid",
+        }),
+      );
+      fs.writeFileSync(
+        consentPath(tmpDir),
+        JSON.stringify({ [path.resolve(tmpDir)]: { claudeMd: "none", activity: "yes" } }),
+      );
+
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+        stdio: ["pipe", "pipe", "pipe"], // piped stdin is load-bearing — a file never reproduced it
+        env: { ...process.env, HOME: tmpDir, USERPROFILE: tmpDir },
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d));
+      child.stdout.resume();
+      const killer = setTimeout(() => child.kill(), 20000);
+
+      child.on("close", (code) => {
+        clearTimeout(killer);
+        cleanup();
+        try {
+          assert.strictEqual(
+            code,
+            0,
+            `hook mode must exit 0, got ${code}. stderr: ${stderr.trim() || "(empty)"}`,
+          );
+          assert.strictEqual(received, 1, `hook mode should have posted exactly 1 row, got ${received}`);
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      child.stdin.end(
+        JSON.stringify({
+          hook_event_name: "PreToolUse",
+          cwd: tmpDir,
+          tool_name: "Bash",
+          tool_input: { command: "echo hi" },
+        }),
+      );
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
