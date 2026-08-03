@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS claude_events (
   -- SessionStart hooks: they never appear in settings.json's "hooks" block and
   -- produce no Skill tool call, so enabledPlugins is the only signal they ran.
   enabled_plugins jsonb,
+  -- Gated on consent.activity === "yes", same as permission_mode/enabled_plugins:
+  -- null on historical rows (no backfill) and on any row where the repo's
+  -- consent isn't activity: "yes". A repo name can itself be sensitive (an
+  -- internal or client project name), so it gets the same opt-in treatment as
+  -- the rest of activity sharing rather than the ungated cwd/git_branch pattern.
+  repo_name text,
   raw jsonb,
   claude_md_share_level text check (claude_md_share_level in ('redacted', 'full')),
   client_ts timestamptz not null default now(),
