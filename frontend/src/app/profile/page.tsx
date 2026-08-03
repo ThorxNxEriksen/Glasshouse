@@ -327,14 +327,10 @@ export default function ProfilePage() {
   const heroRepos = new Set(sessions.map((s) => s.cwd)).size;
 
   const allTools = mergeCounts(sessions, "toolCounts");
-  const totalToolCalls = Object.values(allTools).reduce((a, b) => a + b, 0);
-  const maxToolCount = Math.max(1, ...topEntries(allTools, 6).map(([, c]) => c));
-  const toolBars = topEntries(allTools, 6).map(([name, count]) => ({ name, count, pct: (count / maxToolCount) * 100 }));
 
   // Invoked skills: countable, because each one is a real Skill tool call.
   const allSkills = mergeCounts(sessions, "skillCounts");
   const totalSkillCalls = Object.values(allSkills).reduce((a, b) => a + b, 0);
-  const untypedSkillCalls = (allTools["Skill"] ?? 0) - totalSkillCalls;
   const maxSkillCount = Math.max(1, ...topEntries(allSkills, 8).map(([, c]) => c));
   const skillBars = topEntries(allSkills, 8).map(([name, count]) => ({ name, count, pct: (count / maxSkillCount) * 100 }));
 
@@ -423,7 +419,7 @@ export default function ProfilePage() {
           lastActiveMs: meta?.lastActiveMs ?? 0,
           tools: topEntries(tools, 6).map(([name]) => name),
           mcp: Object.keys(mcp),
-          claudeMdText: claudeMdRow?.content || "Not captured yet for this repo.",
+          claudeMdText: claudeMdRow?.content ?? null,
         };
       })()
     : null;
@@ -500,9 +496,18 @@ export default function ProfilePage() {
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <span style={eyebrowStyle}>Global · {formatRelative(new Date(globalRow.client_ts).getTime())}</span>
                     <h3 style={{ fontSize: "var(--text-base)", fontWeight: "var(--weight-bold)" }}>~/.claude/CLAUDE.md</h3>
-                    <p style={{ margin: 0, fontSize: "var(--text-sm)", lineHeight: "var(--leading-body)", color: "var(--text-body)", whiteSpace: "pre-line" }}>
-                      {globalRow.content || "Not captured yet — will populate after your next session."}
-                    </p>
+                    {globalRow.content ? (
+                      <details>
+                        <summary style={{ cursor: "pointer", fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>
+                          View contents
+                        </summary>
+                        <p style={{ margin: "8px 0 0", fontSize: "var(--text-sm)", lineHeight: "var(--leading-body)", color: "var(--text-body)", whiteSpace: "pre-line" }}>
+                          {globalRow.content}
+                        </p>
+                      </details>
+                    ) : (
+                      <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-faint)" }}>Not captured yet — will populate after your next session.</p>
+                    )}
                   </div>
                 ) : (
                   <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No global CLAUDE.md load recorded yet.</p>
@@ -545,11 +550,6 @@ export default function ProfilePage() {
                       </div>
                     </div>
                   ))}
-                  {untypedSkillCalls > 0 && (
-                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>
-                      + {untypedSkillCalls} older invocation{untypedSkillCalls === 1 ? "" : "s"} recorded before skill names were captured
-                    </span>
-                  )}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 12, borderTop: "1px solid var(--border-subtle)" }}>
                   <span style={eyebrowStyle}>Always on</span>
@@ -565,27 +565,6 @@ export default function ProfilePage() {
                       ))}
                     </div>
                   )}
-                </div>
-              </div>
-            </Card>
-
-            <Card>
-              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                <Badge tone="accent">tool usage</Badge>
-                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{totalToolCalls} tool calls across {sessions.length} sessions</p>
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {toolBars.length === 0 && <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No tool activity recorded yet.</span>}
-                  {toolBars.map((bar) => (
-                    <div key={bar.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                        <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
-                        <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{bar.count}</span>
-                      </div>
-                      <div style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
-                        <div style={{ height: "100%", background: "var(--teal-500)", width: `${bar.pct}%` }} />
-                      </div>
-                    </div>
-                  ))}
                 </div>
               </div>
             </Card>
@@ -784,9 +763,18 @@ export default function ProfilePage() {
             </div>
             <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 10 }}>
               <span style={eyebrowStyle}>claude.md</span>
-              <div style={{ borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", padding: "12px 14px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-body)", whiteSpace: "pre-line" }}>
-                {selectedRepo.claudeMdText}
-              </div>
+              {selectedRepo.claudeMdText ? (
+                <details>
+                  <summary style={{ cursor: "pointer", fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>
+                    View contents
+                  </summary>
+                  <div style={{ marginTop: 8, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", padding: "12px 14px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-body)", whiteSpace: "pre-line" }}>
+                    {selectedRepo.claudeMdText}
+                  </div>
+                </details>
+              ) : (
+                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>Not captured yet for this repo.</span>
+              )}
             </div>
           </aside>
         </>
