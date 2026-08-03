@@ -21,6 +21,8 @@ The two things that bite hardest:
 
 That installed copy is also machine-wide and shared by every session in every repo, so a worktree does not isolate it. Installing is not a local change.
 
+The hook now detects this itself: at `SessionStart`, when the session's cwd is inside a checkout carrying `glasshouse-plugin/glasshouse.mjs`, it compares that file against the copy actually executing and warns if they differ (line endings alone don't count). If you see that warning, **diff the two and keep the union** — the drifted copy usually holds a real fix, so overwriting one with the other loses work. Then `node install.mjs` to sync.
+
 ## How hook mode exits
 
 Hook mode must **not** call `process.exit()`, and `postEvent` must **not** use `fetch()`. Both are enforced by `--self-check` assertions; don't "fix" them.

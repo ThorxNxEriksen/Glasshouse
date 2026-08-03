@@ -332,6 +332,61 @@ function postEvent(config, row) {
 }
 
 // ---------------------------------------------------------------------------
+// Drift check between the copy that runs and the copy in the repo
+//
+// install.mjs drops a standalone copy at ~/.claude/hooks/glasshouse.mjs and
+// that is what actually executes; editing only the repo source changes nothing
+// about real telemetry. The two have silently diverged twice already. When a
+// session is inside a checkout that carries the source, say so at SessionStart
+// instead of letting it rot — see "Two copies of the hook" in CLAUDE.md.
+// ---------------------------------------------------------------------------
+
+function samePath(a, b) {
+  try {
+    // .native normalizes drive-letter and 8.3 casing on Windows
+    return fs.realpathSync.native(a) === fs.realpathSync.native(b);
+  } catch {
+    return path.resolve(a) === path.resolve(b);
+  }
+}
+
+// Where this checkout keeps the hook source, or "" if cwd isn't in one.
+// Uses the git toplevel so it resolves correctly inside a worktree too.
+function repoSourcePath(cwd) {
+  try {
+    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+    if (!top) return "";
+    const source = path.join(top, "glasshouse-plugin", "glasshouse.mjs");
+    return fs.existsSync(source) ? source : "";
+  } catch {
+    return "";
+  }
+}
+
+function hookDriftWarning(selfPath, sourcePath) {
+  if (!selfPath || !sourcePath) return null;
+  if (samePath(selfPath, sourcePath)) return null; // running the repo copy itself
+  try {
+    // Compare content, not bytes: a line-ending difference is not real drift.
+    const read = (p) => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+    if (read(selfPath) === read(sourcePath)) return null;
+  } catch {
+    return null; // unreadable either side — not our business to guess
+  }
+  return (
+    `Glasshouse hook drift: the copy that is actually running differs from this checkout's source. ` +
+    `Running "${selfPath}", source "${sourcePath}". Whichever edit is newer is not live everywhere, ` +
+    `so diff the two and keep the union rather than overwriting one with the other, then re-run ` +
+    `\`node install.mjs\` to sync. Note the installed copy is machine-wide — every session in every ` +
+    `repo shares it, so a git worktree does not isolate it.`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Hook mode
 // ---------------------------------------------------------------------------
 
@@ -367,32 +422,36 @@ async function runHookMode() {
     if (eventName === "SessionStart") {
       const config = loadConfig(homeDir);
       const hookPath = String(process.argv[1] ?? "").split(path.sep).join("/");
+      // Drift is reported alongside any consent/email prompt, not instead of it.
+      const notices = [hookDriftWarning(fileURLToPath(import.meta.url), repoSourcePath(cwd))];
+
       if (!config) {
-        const text =
+        notices.push(
           `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
-          `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
-          `data, then run: node "${hookPath}" set-email --email "<email>". ` +
-          `Nothing is sent anywhere until that command runs.`;
-        process.stdout.write(
-          JSON.stringify({
-            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
-          }) + "\n",
+            `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
+            `data, then run: node "${hookPath}" set-email --email "<email>". ` +
+            `Nothing is sent anywhere until that command runs.`,
         );
       } else if (!consent) {
-        const text =
+        notices.push(
           `Glasshouse usage analytics has no sharing preference on file for this repo yet. ` +
-          `Ask the user via AskUserQuestion, exactly two questions: ` +
-          `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
-          `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing) — yes / no. ` +
-          `Then run: node "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
-          `Nothing is sent for this repo until that command runs.`;
-        process.stdout.write(
-          JSON.stringify({
-            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
-          }) + "\n",
+            `Ask the user via AskUserQuestion, exactly two questions: ` +
+            `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
+            `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing) — yes / no. ` +
+            `Then run: node "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
+            `Nothing is sent for this repo until that command runs.`,
         );
       } else if (consent.activity === "yes") {
         await sendIfConsented(eventName, payload, consent, homeDir, settingsPath);
+      }
+
+      const text = notices.filter(Boolean).join("\n\n");
+      if (text) {
+        process.stdout.write(
+          JSON.stringify({
+            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
+          }) + "\n",
+        );
       }
     } else if (eventName === "InstructionsLoaded") {
       if (consent && consent.claudeMd !== "none") {
@@ -650,6 +709,34 @@ async function selfCheck() {
     });
     assert.strictEqual("transcript_path" in leakRow.raw, false);
     assert.strictEqual("prompt_id" in leakRow.raw, false);
+  }
+
+  // hookDriftWarning: only fires on a real content difference between the copy
+  // that runs and the repo source, and never on line endings alone.
+  const driftDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-drift-"));
+  try {
+    const installed = path.join(driftDir, "installed.mjs");
+    const source = path.join(driftDir, "source.mjs");
+
+    fs.writeFileSync(installed, "const a = 1;\nconst b = 2;\n");
+    fs.writeFileSync(source, "const a = 1;\nconst b = 2;\n");
+    assert.strictEqual(hookDriftWarning(installed, source), null, "identical copies must not warn");
+
+    // CRLF vs LF is not drift.
+    fs.writeFileSync(source, "const a = 1;\r\nconst b = 2;\r\n");
+    assert.strictEqual(hookDriftWarning(installed, source), null, "line endings alone must not warn");
+
+    // A real difference must warn, and must name both paths so it is actionable.
+    fs.writeFileSync(source, "const a = 1;\nconst b = 3;\n");
+    const warning = hookDriftWarning(installed, source);
+    assert.ok(warning && warning.includes(installed) && warning.includes(source), "drift must name both paths");
+
+    // Running the repo copy directly is not drift, and neither is a missing side.
+    assert.strictEqual(hookDriftWarning(source, source), null, "same file must not warn");
+    assert.strictEqual(hookDriftWarning(installed, ""), null, "no repo source means nothing to compare");
+    assert.strictEqual(hookDriftWarning(installed, path.join(driftDir, "gone.mjs")), null, "missing source must not warn");
+  } finally {
+    fs.rmSync(driftDir, { recursive: true, force: true });
   }
 
   // The Windows libuv abort ("!(handle->flags & UV_HANDLE_CLOSING)") that used
