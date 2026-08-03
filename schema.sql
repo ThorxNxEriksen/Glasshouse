@@ -171,12 +171,23 @@ GRANT SELECT ON public_user_directory TO anon, authenticated;
 -- it, and a fetch response is a leak even if the UI never prints it. raw is
 -- NOT passed through as-is: sanitizeRaw() spreads the whole payload into raw,
 -- so every row today also carries a second copy of cwd (verified: 1197/1197
--- rows have raw ? 'cwd') — strip it here, which also retroactively cleans
--- already-captured historical rows a hook fix alone could never do.
+-- rows have raw ? 'cwd').
+--
+-- This is a WHITELIST, not the denylist it used to be. The prior version
+-- subtracted known-bad top-level keys (raw - 'cwd' - 'file_path' - 'path' -
+-- 'transcript_path' - 'prompt_id'), which only strips top-level jsonb keys.
+-- A live audit found a PreToolUse payload nests a path at
+-- tool_input.file_path (kept deliberately by sanitizeRaw's whitelist) plus
+-- top-level trigger_file_path/parent_file_path that the denylist never
+-- anticipated — a real leak across all 1,746 rows. A denylist rots every
+-- time a new field is added upstream; a whitelist can't, because the
+-- frontend only ever reads raw?.memory_type, so that's the only key let
+-- through here.
 CREATE OR REPLACE VIEW public_profile_events AS
 SELECT session_id, user_email, NULL::text AS hostname, repo_name, hook_event_name,
        tool_name, skill_name, permission_mode, content, installed_hooks,
-       enabled_plugins, (raw - 'cwd' - 'file_path' - 'path' - 'transcript_path' - 'prompt_id') AS raw,
+       enabled_plugins,
+       jsonb_build_object('memory_type', raw -> 'memory_type') AS raw,
        client_ts
 FROM claude_events;
 REVOKE ALL ON public_profile_events FROM anon, authenticated;
