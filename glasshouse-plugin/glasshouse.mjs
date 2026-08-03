@@ -118,6 +118,21 @@ function gitBranch(cwd) {
 // CLAUDE.md redaction
 // ---------------------------------------------------------------------------
 
+// Claude Code's InstructionsLoaded payload carries file_path/memory_type/
+// load_reason but not the file's text — read it ourselves when the payload
+// doesn't already inline it (older/future Claude Code versions might).
+function readInstructionsContent(payload) {
+  const inline = payload?.content ?? payload?.instructions;
+  if (typeof inline === "string" && inline) return inline;
+  const filePath = payload?.file_path ?? payload?.path;
+  if (typeof filePath !== "string" || !filePath) return "";
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
 function redactClaudeMd(content) {
   const lines = content.split("\n");
   const totalLines = lines.length;
@@ -150,6 +165,24 @@ function readInstalledHooks(settingsPath) {
   }
 }
 
+// Always-on skills never show up as Skill tool calls: plugins like superpowers
+// and ponytail inject their skill text via a SessionStart hook, and plugin hooks
+// live in the plugin's own manifest, not in settings.json's "hooks" block — so
+// readInstalledHooks cannot see them either. The enabled-plugin set is the only
+// local signal that those skills were active. Names only (public marketplace
+// identifiers like "ponytail@ponytail"); no paths, no versions.
+function readEnabledPlugins(settingsPath) {
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    const plugins = settings?.enabledPlugins;
+    if (!plugins || typeof plugins !== "object") return [];
+    // Disabled entries are present-but-false, so filter on the value, not the key.
+    return Object.keys(plugins).filter((name) => plugins[name] === true).sort();
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Row assembly
 // ---------------------------------------------------------------------------
@@ -174,7 +207,13 @@ function sanitizeRaw(payload, eventName, consent) {
   } else if (eventName === "PreToolUse") {
     sanitized = { ...payload };
     if (sanitized.tool_input && typeof sanitized.tool_input === "object") {
-      sanitized.tool_input = { file_path: sanitized.tool_input.file_path ?? null };
+      // Strict whitelist. `skill` is a public plugin identifier and safe to keep;
+      // `args` sits right next to it in the same payload and must NEVER be added
+      // here — it carries free-text user content (project briefs, prompts).
+      sanitized.tool_input = {
+        file_path: sanitized.tool_input.file_path ?? null,
+        skill: sanitized.tool_input.skill ?? null,
+      };
     }
   } else {
     // SessionStart / SessionEnd / anything else: no content-bearing fields, passthrough (copied).
@@ -211,14 +250,19 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
 
   if (eventName === "SessionStart") {
     row.installed_hooks = readInstalledHooks(settingsPath);
+    row.enabled_plugins = consent?.activity === "yes" ? readEnabledPlugins(settingsPath) : null;
   } else if (eventName === "InstructionsLoaded") {
-    const rawContent = payload?.content ?? payload?.instructions ?? "";
+    const rawContent = readInstructionsContent(payload);
     row.content = consent?.claudeMd === "redacted" ? redactClaudeMd(rawContent) : rawContent;
     row.file_path = payload?.file_path ?? payload?.path ?? "";
     row.load_reason = payload?.load_reason ?? payload?.reason ?? "";
   } else if (eventName === "PreToolUse") {
     row.tool_name = payload?.tool_name ?? null;
     row.file_path = payload?.tool_input?.file_path ?? null;
+    // tool_name is always the literal "Skill" for a skill invocation — the skill's
+    // own name only exists in tool_input.skill, which is why per-skill usage was
+    // unreportable until this column existed.
+    row.skill_name = payload?.tool_input?.skill ?? null;
   }
   // SessionEnd: boundary marker — common fields only, no tool_name/content.
 
@@ -404,6 +448,20 @@ function selfCheck() {
   ].join("\n");
   assert.strictEqual(redactClaudeMd(content), expected);
 
+  // readInstructionsContent: inline payload.content/instructions wins; else
+  // reads file_path from disk; missing/unreadable file falls back to "".
+  assert.strictEqual(readInstructionsContent({ content: "inline text" }), "inline text");
+  assert.strictEqual(readInstructionsContent({ instructions: "inline alt" }), "inline alt");
+  const tmpFile = path.join(os.tmpdir(), `glasshouse-selfcheck-${process.pid}.md`);
+  try {
+    fs.writeFileSync(tmpFile, "# From disk\nbody");
+    assert.strictEqual(readInstructionsContent({ file_path: tmpFile }), "# From disk\nbody");
+  } finally {
+    fs.rmSync(tmpFile, { force: true });
+  }
+  assert.strictEqual(readInstructionsContent({ file_path: path.join(os.tmpdir(), "glasshouse-selfcheck-missing.md") }), "");
+  assert.strictEqual(readInstructionsContent({}), "");
+
   // computeRepoKey: falls back to path.resolve(cwd) for a dir with no git remote.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-selfcheck-"));
   try {
@@ -484,7 +542,51 @@ function selfCheck() {
     config: {},
     settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
   });
-  assert.deepStrictEqual(Object.keys(preToolRow.raw.tool_input), ["file_path"]);
+  assert.deepStrictEqual(Object.keys(preToolRow.raw.tool_input), ["file_path", "skill"]);
+  assert.strictEqual(preToolRow.skill_name, null); // not a Skill call
+  assert.strictEqual("content" in preToolRow.raw.tool_input, false);
+
+  // Skill invocations: the name must survive to row.skill_name (tool_name is
+  // only ever the literal "Skill"), and `args` must not survive anywhere — it is
+  // free-text user content. This is the assertion that fails if the tool_input
+  // whitelist above is ever widened carelessly.
+  const secretArgs = "confidential client brief that must never leave the machine";
+  const skillRow = buildRow({
+    eventName: "PreToolUse",
+    payload: {
+      cwd: "/tmp/x",
+      tool_name: "Skill",
+      tool_input: { skill: "superpowers:brainstorming", args: secretArgs },
+    },
+    consent: { claudeMd: "none", activity: "yes" },
+    config: {},
+    settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+  });
+  assert.strictEqual(skillRow.tool_name, "Skill");
+  assert.strictEqual(skillRow.skill_name, "superpowers:brainstorming");
+  assert.strictEqual(JSON.stringify(skillRow).includes(secretArgs), false);
+
+  // enabled_plugins: only entries explicitly true, and gated on activity consent.
+  const pluginSettings = path.join(os.tmpdir(), `glasshouse-plugins-${process.pid}.json`);
+  try {
+    fs.writeFileSync(
+      pluginSettings,
+      JSON.stringify({ enabledPlugins: { "ponytail@ponytail": true, "off@marketplace": false } }),
+    );
+    assert.deepStrictEqual(readEnabledPlugins(pluginSettings), ["ponytail@ponytail"]);
+    const args = { eventName: "SessionStart", payload: { cwd: "/tmp/x" }, config: {}, settingsPath: pluginSettings };
+    assert.deepStrictEqual(
+      buildRow({ ...args, consent: { claudeMd: "none", activity: "yes" } }).enabled_plugins,
+      ["ponytail@ponytail"],
+    );
+    assert.strictEqual(
+      buildRow({ ...args, consent: { claudeMd: "none", activity: "no" } }).enabled_plugins,
+      null,
+    );
+  } finally {
+    fs.rmSync(pluginSettings, { force: true });
+  }
+  assert.deepStrictEqual(readEnabledPlugins(path.join(os.tmpdir(), "glasshouse-no-such.json")), []);
 
   // permission_mode is gated on activity consent ("activity sharing" covers both
   // tool/skill/MCP usage AND permission-mode timing) — activity !== "yes" must
