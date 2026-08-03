@@ -152,3 +152,60 @@ GROUP BY session_id, skill_name;
 
 REVOKE ALL ON session_skill_usage FROM anon;
 GRANT SELECT ON session_skill_usage TO authenticated;
+
+-- Public views (anon-readable). Deliberately NOT security_invoker — claude_events
+-- blocks anon at the base-table grant (INSERT only), so a security_invoker view
+-- would return zero rows to anon regardless of its own logic. These run with
+-- the view owner's privilege instead, and their column lists ARE the security
+-- boundary (no RLS backstop) — checked against consent gating and known
+-- identifying fields (hostname, cwd, and raw's embedded copy of cwd/file_path).
+
+CREATE OR REPLACE VIEW public_user_directory AS
+SELECT user_email, MAX(client_ts) AS last_active, COUNT(DISTINCT session_id) AS run_count
+FROM claude_events WHERE user_email IS NOT NULL GROUP BY user_email;
+REVOKE ALL ON public_user_directory FROM anon, authenticated;
+GRANT SELECT ON public_user_directory TO anon, authenticated;
+
+-- hostname nulled (machine name, never consented). cwd dropped entirely, not
+-- just unrendered — it's a full local path, typically with the OS username in
+-- it, and a fetch response is a leak even if the UI never prints it. raw is
+-- NOT passed through as-is: sanitizeRaw() spreads the whole payload into raw,
+-- so every row today also carries a second copy of cwd (verified: 1197/1197
+-- rows have raw ? 'cwd') — strip it here, which also retroactively cleans
+-- already-captured historical rows a hook fix alone could never do.
+CREATE OR REPLACE VIEW public_profile_events AS
+SELECT session_id, user_email, NULL::text AS hostname, repo_name, hook_event_name,
+       tool_name, skill_name, permission_mode, content, installed_hooks,
+       enabled_plugins, (raw - 'cwd' - 'file_path' - 'path' - 'transcript_path' - 'prompt_id') AS raw,
+       client_ts
+FROM claude_events;
+REVOKE ALL ON public_profile_events FROM anon, authenticated;
+GRANT SELECT ON public_profile_events TO anon, authenticated;
+
+CREATE OR REPLACE VIEW public_tool_totals AS
+SELECT tool_name, COUNT(*) AS call_count FROM claude_events
+WHERE hook_event_name = 'PreToolUse' AND tool_name IS NOT NULL GROUP BY tool_name;
+REVOKE ALL ON public_tool_totals FROM anon, authenticated;
+GRANT SELECT ON public_tool_totals TO anon, authenticated;
+
+CREATE OR REPLACE VIEW public_skill_totals AS
+SELECT skill_name, COUNT(*) AS call_count FROM claude_events
+WHERE hook_event_name = 'PreToolUse' AND tool_name = 'Skill' AND skill_name IS NOT NULL
+GROUP BY skill_name;
+REVOKE ALL ON public_skill_totals FROM anon, authenticated;
+GRANT SELECT ON public_skill_totals TO anon, authenticated;
+
+-- "Currently enabled" = as of each user's most recent SessionStart with a
+-- non-null enabled_plugins (DISTINCT ON per user_email, latest client_ts).
+CREATE OR REPLACE VIEW public_plugin_adoption AS
+WITH latest_session_start AS (
+  SELECT DISTINCT ON (user_email) user_email, enabled_plugins
+  FROM claude_events
+  WHERE hook_event_name = 'SessionStart' AND enabled_plugins IS NOT NULL AND user_email IS NOT NULL
+  ORDER BY user_email, client_ts DESC
+)
+SELECT plugin.name AS plugin_name, COUNT(DISTINCT user_email) AS user_count
+FROM latest_session_start, LATERAL jsonb_array_elements_text(enabled_plugins) AS plugin(name)
+GROUP BY plugin.name ORDER BY user_count DESC;
+REVOKE ALL ON public_plugin_adoption FROM anon, authenticated;
+GRANT SELECT ON public_plugin_adoption TO anon, authenticated;
