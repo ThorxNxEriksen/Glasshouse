@@ -26,6 +26,7 @@ import "./ds.css";
 import { Avatar, Badge, Button, Card, StatBlock, Tag } from "./ds";
 import { getSupabaseClient, sendMagicLink } from "../../../lib/supabaseClient";
 import { useSupabaseSession } from "../../../lib/useSupabaseSession";
+import { parseMcpServer } from "../../../lib/mcp";
 
 interface EventRow {
   session_id: string | null;
@@ -75,12 +76,6 @@ function basename(p: string) {
 function parentName(p: string) {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return parts.length > 1 ? parts[parts.length - 2] : "";
-}
-
-function parseMcpServer(toolName: string): string | null {
-  const m = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName);
-  if (!m) return null;
-  return m[1].replace(/^claude_ai_/, "").replace(/_/g, " ");
 }
 
 function formatRelative(ms: number) {
