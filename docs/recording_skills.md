@@ -302,10 +302,11 @@ is populated and no `args` is present.
 **There are two copies of the hook, and the repo one may not be the live one.**
 `install.mjs` drops a standalone copy at `~/.claude/hooks/glasshouse.mjs`, and
 that is what `settings.json` points at. Editing only
-`glasshouse-plugin/glasshouse.mjs` changes nothing about your own telemetry. The
-two have drifted in *both* directions before (the libuv
-`UV_HANDLE_CLOSING` fix in one, `readInstructionsContent` in the other). Always
-`diff` them before assuming a fix is live.
+`glasshouse-plugin/glasshouse.mjs` changes nothing about your own telemetry — a
+skill-capture fix applied to the repo copy alone will not appear in your own
+data. The two were reconciled in `d5ec9f6` and are identical as of that commit,
+but they have drifted in *both* directions before, so `diff` them before
+assuming a fix is live. Details in [`hook.md`](hook.md).
 
 **`enabled_plugins` needs a fresh session.** It is captured on `SessionStart`, so
 it stays null for the session in which the change was deployed. An empty "Always
