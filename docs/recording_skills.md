@@ -127,9 +127,17 @@ Plus `claude_events_skill_name_idx` (partial, `where skill_name is not null`) an
 the `session_skill_usage` view — same shape as `session_tool_usage`, one grain
 finer, because `tool_name` alone cannot distinguish two different skills.
 
-Both are gated on **activity** consent, identically to tool/MCP usage and
-permission-mode timing. `enabled_plugins` is explicitly nulled when
+Both are gated on **activity** consent, identically to tool/MCP usage,
+permission-mode timing, and `repo_name`. `enabled_plugins` is explicitly nulled when
 `consent.activity !== "yes"`, so it cannot become a side channel.
+
+**Known limitation:** `public_user_directory` lists any user with a non-null
+`user_email` from *any* event, not just activity-consented ones —
+`InstructionsLoaded` rows send `user_email` regardless of `consent.activity`,
+gated only on `claudeMd` sharing. So a user who declines activity sharing but
+accepts CLAUDE.md sharing still appears in the public directory with a
+`run_count`, even though they never opted into activity metrics. Not fixed
+here; the view/gating logic needs a follow-up.
 
 ### Historical rows are null, permanently
 

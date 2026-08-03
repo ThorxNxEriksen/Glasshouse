@@ -56,6 +56,26 @@ behaviourally.
 
 ---
 
+## The public view surface
+
+Five `public_*` Supabase views (`public_user_directory`, `public_profile_events`,
+`public_tool_totals`, `public_skill_totals`, `public_plugin_adoption` — see
+`schema.sql`) are anon-readable and serve this data directly to unauthenticated
+visitors. There is no RLS backstop on them: the base table blocks `anon` at the
+grant level (insert-only), so these views run with the owner's privilege and
+their column lists *are* the entire security boundary.
+
+Any future change to what `sanitizeRaw`/`buildRow` puts into a row's `raw`
+column must be re-audited against every one of these views, not just against
+`claude_events`' own RLS policy. This is exactly the class of bug that produced
+a live data leak in `public_profile_events.raw`: a denylist of top-level keys
+missed a nested path (`tool_input.file_path`) and renamed top-level keys
+(`trigger_file_path`, `parent_file_path`) that a later payload shape
+introduced. The fix replaced the denylist with a whitelist for that reason —
+but a whitelist still needs re-checking whenever a view's column list changes.
+
+---
+
 ## Checking your changes
 
 ```bash

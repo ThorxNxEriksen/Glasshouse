@@ -440,7 +440,8 @@ async function runHookMode() {
           `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
             `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
             `data, then run: node "${hookPath}" set-email --email "<email>". ` +
-            `Nothing is sent anywhere until that command runs.`,
+            `Nothing is sent anywhere until that command runs. ` +
+            `This email will be shown on Glasshouse's public directory page and used in your profile's URL.`,
         );
       } else if (!consent) {
         notices.push(
