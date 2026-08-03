@@ -27,6 +27,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import "../ds.css";
 import { Avatar, Badge, Button, Card, StatBlock, Tag } from "../ds";
+import { CodeBlock } from "../CodeBlock";
+import { PLUGIN_GITHUB_URLS } from "../skillLinks";
 import { getSupabaseClient } from "../../../../lib/supabaseClient";
 import { parseMcpServer } from "../../../../lib/mcp";
 
@@ -53,6 +55,7 @@ const MODE_COLORS: Record<string, string> = {
   acceptEdits: "var(--success)",
   dontAsk: "var(--danger)",
   bypassPermissions: "var(--danger)",
+  waiting: "var(--grey-300)",
 };
 const MODE_LABELS: Record<string, string> = {
   plan: "Plan mode",
@@ -62,7 +65,15 @@ const MODE_LABELS: Record<string, string> = {
   acceptEdits: "Accept edits",
   dontAsk: "Don't ask",
   bypassPermissions: "Bypass permissions",
+  waiting: "Waiting for input",
 };
+
+// ponytail: naive fixed-ceiling idle heuristic — any gap longer than this is
+// treated as the user stepping away rather than active work in that mode.
+// Upgrade path: derive the threshold from each user's own gap distribution
+// instead of one constant for everybody, if this starts misclassifying long
+// but genuine active-mode segments as idle.
+const IDLE_GAP_MS = 3 * 60 * 1000;
 function modeColor(mode: string) {
   return MODE_COLORS[mode] ?? "var(--grey-300)";
 }
@@ -91,10 +102,22 @@ interface SessionAgg {
   startMs: number;
   endMs: number;
   segments: { mode: string; ms: number }[];
-  skillEventsMs: number[];
   toolCounts: Record<string, number>;
   skillCounts: Record<string, number>;
   agentCalls: number;
+}
+
+function mergeSegments(raw: { mode: string; ms: number }[]): { mode: string; ms: number }[] {
+  const merged: { mode: string; ms: number }[] = [];
+  for (const seg of raw) {
+    const last = merged[merged.length - 1];
+    if (last && last.mode === seg.mode) {
+      last.ms += seg.ms;
+    } else {
+      merged.push({ mode: seg.mode, ms: seg.ms });
+    }
+  }
+  return merged;
 }
 
 function aggregateSessions(rows: EventRow[]): SessionAgg[] {
@@ -111,8 +134,7 @@ function aggregateSessions(rows: EventRow[]): SessionAgg[] {
     sessionRows.sort((a, b) => new Date(a.client_ts).getTime() - new Date(b.client_ts).getTime());
     const repoKey = sessionRows.find((r) => r.repo_name)?.repo_name ?? "(unknown repo)";
     const times = sessionRows.map((r) => new Date(r.client_ts).getTime());
-    const segments: { mode: string; ms: number }[] = [];
-    const skillEventsMs: number[] = [];
+    const rawSegments: { mode: string; ms: number }[] = [];
     const toolCounts: Record<string, number> = {};
     const skillCounts: Record<string, number> = {};
     let agentCalls = 0;
@@ -120,19 +142,23 @@ function aggregateSessions(rows: EventRow[]): SessionAgg[] {
     for (let i = 0; i < sessionRows.length; i++) {
       const row = sessionRows[i];
       if (row.permission_mode && i + 1 < sessionRows.length) {
-        segments.push({ mode: row.permission_mode, ms: times[i + 1] - times[i] });
+        rawSegments.push({ mode: row.permission_mode, ms: times[i + 1] - times[i] });
       }
       if (row.hook_event_name === "PreToolUse" && row.tool_name) {
         toolCounts[row.tool_name] = (toolCounts[row.tool_name] ?? 0) + 1;
         if (row.tool_name === "Skill") {
-          skillEventsMs.push(times[i]);
           // skill_name is null on rows captured before it was a column — those
-          // still count as timeline events above, just not per-name below.
+          // still count toward toolCounts above, just not per-name below.
           if (row.skill_name) skillCounts[row.skill_name] = (skillCounts[row.skill_name] ?? 0) + 1;
         }
         if (row.tool_name === "Agent") agentCalls += 1;
       }
     }
+
+    // Gaps longer than IDLE_GAP_MS are idle time, not active mode time —
+    // bucket those into "waiting" before merging same-mode runs together.
+    const reclassified = rawSegments.map((seg) => (seg.ms > IDLE_GAP_MS ? { mode: "waiting", ms: seg.ms } : seg));
+    const segments = mergeSegments(reclassified);
 
     sessions.push({
       sessionId,
@@ -140,7 +166,6 @@ function aggregateSessions(rows: EventRow[]): SessionAgg[] {
       startMs: times[0],
       endMs: times[times.length - 1],
       segments,
-      skillEventsMs,
       toolCounts,
       skillCounts,
       agentCalls,
@@ -154,14 +179,12 @@ interface Terminal {
   offsetMs: number;
   durationMs: number;
   segments: { mode: string; ms: number }[];
-  eventsMs: number[];
 }
 interface RunGroup {
   repoKey: string;
   startMs: number;
   totalMs: number;
   agents: number;
-  toolCounts: Record<string, number>;
   terminals: Terminal[];
 }
 
@@ -183,13 +206,11 @@ function buildRun(cluster: SessionAgg[]): RunGroup {
     startMs,
     totalMs: endMs - startMs,
     agents: cluster.reduce((sum, s) => sum + 1 + s.agentCalls, 0),
-    toolCounts: mergeCounts(cluster, "toolCounts"),
     terminals: cluster.map((s, i) => ({
       label: cluster.length > 1 ? `Terminal ${i + 1}` : null,
       offsetMs: s.startMs - startMs,
       durationMs: s.endMs - s.startMs || 1,
       segments: s.segments,
-      eventsMs: s.skillEventsMs,
     })),
   };
 }
@@ -218,6 +239,21 @@ function topEntries(counts: Record<string, number>, n: number) {
   return Object.entries(counts)
     .sort((a, b) => b[1] - a[1])
     .slice(0, n);
+}
+
+// Plugin-skill names follow a `plugin:skill-name` convention. Link out to the
+// plugin's GitHub repo when the prefix is a known plugin; never guess a URL
+// for unmapped prefixes or bare (non-plugin) skill names.
+function skillNameNode(name: string) {
+  const sep = name.indexOf(":");
+  if (sep === -1) return name;
+  const url = PLUGIN_GITHUB_URLS[name.slice(0, sep)];
+  if (!url) return name;
+  return (
+    <a href={url} target="_blank" rel="noreferrer">
+      {name}
+    </a>
+  );
 }
 
 const eyebrowStyle = {
@@ -312,26 +348,21 @@ export default function ProfilePage() {
       barLeftPct: (t.offsetMs / totalSpan) * 100,
       barWidthPct: (t.durationMs / totalSpan) * 100,
       segments: t.segments.map((seg) => ({ color: modeColor(seg.mode), widthPct: (seg.ms / t.durationMs) * 100 })),
-      events: t.eventsMs.map((atMs) => ({ leftPct: ((atMs - run.startMs) / totalSpan) * 100 })),
     }));
     const singleSegments = !isMulti ? run.terminals[0].segments : [];
-    const hasEvents = run.terminals.some((t) => t.eventsMs.length > 0);
     const totalMinutes = Math.round(run.totalMs / 60000);
     const legendItems = !isMulti
       ? singleSegments.map((seg, si) => ({ key: String(si), color: modeColor(seg.mode), label: `${modeLabel(seg.mode)} · ${Math.round(seg.ms / 60000)} min` }))
       : [];
-    if (hasEvents) legendItems.push({ key: "skill", color: "var(--teal-500)", label: "Skill invoked" });
     return {
       key: `${run.repoKey}-${run.startMs}`,
       repoKey: run.repoKey,
       repoName: run.repoKey,
       metaText: `${dayLabel(run.startMs)} · ${totalMinutes} min ${isMulti ? "elapsed" : "total"}`,
       agentsLabel: `${run.agents} ${run.agents === 1 ? "agent" : "agents"}`,
-      isMulti,
-      terminalsLabel: `${run.terminals.length} terminals`,
+      sessionsLabel: `${run.terminals.length} session${run.terminals.length === 1 ? "" : "s"}`,
       terminals,
       legendItems,
-      toolChips: topEntries(run.toolCounts, 4).map(([name]) => name),
     };
   });
 
@@ -422,7 +453,6 @@ export default function ProfilePage() {
         </Card>
 
         <section id="changes" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <h2 style={{ fontSize: "var(--text-h2)", fontWeight: "var(--weight-regular)" }}>How I work</h2>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -436,9 +466,9 @@ export default function ProfilePage() {
                         <summary style={{ cursor: "pointer", fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>
                           View contents
                         </summary>
-                        <p style={{ margin: "8px 0 0", fontSize: "var(--text-sm)", lineHeight: "var(--leading-body)", color: "var(--text-body)", whiteSpace: "pre-line" }}>
-                          {globalRow.content}
-                        </p>
+                        <div style={{ marginTop: 8 }}>
+                          <CodeBlock text={globalRow.content} />
+                        </div>
                       </details>
                     ) : (
                       <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-faint)" }}>Not captured yet — will populate after your next session.</p>
@@ -476,11 +506,8 @@ export default function ProfilePage() {
                   )}
                   {skillBars.map((bar) => (
                     <div key={bar.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                        <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
-                        <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{bar.count}</span>
-                      </div>
-                      <div style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
+                      <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{skillNameNode(bar.name)}</span>
+                      <div title={String(bar.count)} style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
                         <div style={{ height: "100%", background: "var(--lavender-500)", width: `${bar.pct}%` }} />
                       </div>
                     </div>
@@ -539,11 +566,8 @@ export default function ProfilePage() {
                   {mcpBars.length === 0 && <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No MCP activity recorded yet.</span>}
                   {mcpBars.map((bar) => (
                     <div key={bar.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-                        <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
-                        <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{bar.count}</span>
-                      </div>
-                      <div style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
+                      <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
+                      <div title={String(bar.count)} style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
                         <div style={{ height: "100%", borderRadius: "var(--radius-pill)", background: "var(--success)", width: `${bar.pct}%` }} />
                       </div>
                     </div>
@@ -596,7 +620,7 @@ export default function ProfilePage() {
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <Badge tone="neutral">{run.agentsLabel}</Badge>
-                      {run.isMulti && <Badge tone="accent">{run.terminalsLabel}</Badge>}
+                      <Badge tone="accent">{run.sessionsLabel}</Badge>
                     </div>
                   </div>
 
@@ -612,24 +636,6 @@ export default function ProfilePage() {
                               <div key={si} style={{ height: "100%", width: `${seg.widthPct}%`, background: seg.color }} />
                             ))}
                           </div>
-                          {terminal.events.map((ev, ei) => (
-                            <div
-                              key={ei}
-                              title="Skill invoked"
-                              style={{
-                                position: "absolute",
-                                top: "50%",
-                                width: 9,
-                                height: 9,
-                                marginTop: -4.5,
-                                marginLeft: -4.5,
-                                borderRadius: 9999,
-                                boxShadow: "0 0 0 2px var(--surface-card)",
-                                left: `${ev.leftPct}%`,
-                                background: "var(--teal-500)",
-                              }}
-                            />
-                          ))}
                         </div>
                       </div>
                     ))}
@@ -645,14 +651,6 @@ export default function ProfilePage() {
                       ))}
                     </div>
                   )}
-
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    {run.toolChips.length > 0 ? (
-                      run.toolChips.map((chip) => <Tag key={chip}>{chip}</Tag>)
-                    ) : (
-                      <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>no tool activity</span>
-                    )}
-                  </div>
                 </div>
               </Card>
             ))}
@@ -700,8 +698,8 @@ export default function ProfilePage() {
                   <summary style={{ cursor: "pointer", fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>
                     View contents
                   </summary>
-                  <div style={{ marginTop: 8, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", padding: "12px 14px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-body)", whiteSpace: "pre-line" }}>
-                    {selectedRepo.claudeMdText}
+                  <div style={{ marginTop: 8 }}>
+                    <CodeBlock text={selectedRepo.claudeMdText} />
                   </div>
                 </details>
               ) : (
