@@ -2,7 +2,8 @@
 
 // Port of the "Agent Glassdoor" Claude Design mock (claude.ai/design project
 // 456c8123-11e2-4104-875b-cc9fc485b3ea, Agent Glassdoor.dc.html), wired to
-// the real Glasshouse claude_events data instead of the mock's demo arrays.
+// the real Glasshouse public_profile_events data instead of the mock's demo
+// arrays.
 //
 // A few cards had to be reinterpreted because the real schema doesn't carry
 // what the mock assumed:
@@ -16,27 +17,27 @@
 // - "Hooks" (named hooks + descriptions) isn't tracked — command strings are
 //   deliberately scrubbed to avoid leaking local paths. Shows the real
 //   registered hook events + matchers instead.
-// - "Repos" are grouped by literal cwd (not normalized to a git repo root),
-//   so a repo and a subdirectory/worktree can appear as separate entries.
+// - "Repos" are grouped by repo_name (the hook-captured repo identity), not a
+//   normalized git repo root, so a repo and a subdirectory/worktree can appear
+//   as separate entries. There is no local filesystem path (cwd) available on
+//   this public view at all — repo_name is the only repo-identity field.
 // - The status line / GitHub link in the mock were fabricated bio flavor
-//   text with no tracked equivalent — dropped in favor of the real signed-in
-//   user's email.
+//   text with no tracked equivalent — dropped in favor of the profile's email.
 import { useEffect, useMemo, useState } from "react";
-import "./ds.css";
-import { Avatar, Badge, Button, Card, StatBlock, Tag } from "./ds";
-import { getSupabaseClient, sendMagicLink } from "../../../lib/supabaseClient";
-import { useSupabaseSession } from "../../../lib/useSupabaseSession";
-import { parseMcpServer } from "../../../lib/mcp";
+import { useParams } from "next/navigation";
+import "../ds.css";
+import { Avatar, Badge, Button, Card, StatBlock, Tag } from "../ds";
+import { getSupabaseClient } from "../../../../lib/supabaseClient";
+import { parseMcpServer } from "../../../../lib/mcp";
 
 interface EventRow {
   session_id: string | null;
   user_email: string | null;
-  hostname: string | null;
   hook_event_name: string | null;
   tool_name: string | null;
   skill_name: string | null;
   permission_mode: string | null;
-  cwd: string | null;
+  repo_name: string | null;
   content: string | null;
   installed_hooks: Record<string, string[]> | null;
   enabled_plugins: string[] | null;
@@ -69,15 +70,6 @@ function modeLabel(mode: string) {
   return MODE_LABELS[mode] ?? mode;
 }
 
-function basename(p: string) {
-  const parts = p.split(/[\\/]/).filter(Boolean);
-  return parts[parts.length - 1] ?? p;
-}
-function parentName(p: string) {
-  const parts = p.split(/[\\/]/).filter(Boolean);
-  return parts.length > 1 ? parts[parts.length - 2] : "";
-}
-
 function formatRelative(ms: number) {
   const diffMin = Math.round((Date.now() - ms) / 60000);
   if (diffMin < 1) return "just now";
@@ -95,7 +87,7 @@ function dayLabel(ms: number) {
 
 interface SessionAgg {
   sessionId: string;
-  cwd: string;
+  repoKey: string;
   startMs: number;
   endMs: number;
   segments: { mode: string; ms: number }[];
@@ -117,7 +109,7 @@ function aggregateSessions(rows: EventRow[]): SessionAgg[] {
   const sessions: SessionAgg[] = [];
   for (const [sessionId, sessionRows] of bySession) {
     sessionRows.sort((a, b) => new Date(a.client_ts).getTime() - new Date(b.client_ts).getTime());
-    const cwd = sessionRows.find((r) => r.cwd)?.cwd ?? "(unknown)";
+    const repoKey = sessionRows.find((r) => r.repo_name)?.repo_name ?? "(unknown repo)";
     const times = sessionRows.map((r) => new Date(r.client_ts).getTime());
     const segments: { mode: string; ms: number }[] = [];
     const skillEventsMs: number[] = [];
@@ -144,7 +136,7 @@ function aggregateSessions(rows: EventRow[]): SessionAgg[] {
 
     sessions.push({
       sessionId,
-      cwd,
+      repoKey,
       startMs: times[0],
       endMs: times[times.length - 1],
       segments,
@@ -165,7 +157,7 @@ interface Terminal {
   eventsMs: number[];
 }
 interface RunGroup {
-  cwd: string;
+  repoKey: string;
   startMs: number;
   totalMs: number;
   agents: number;
@@ -187,7 +179,7 @@ function buildRun(cluster: SessionAgg[]): RunGroup {
   const startMs = Math.min(...cluster.map((s) => s.startMs));
   const endMs = Math.max(...cluster.map((s) => s.endMs));
   return {
-    cwd: cluster[0].cwd,
+    repoKey: cluster[0].repoKey,
     startMs,
     totalMs: endMs - startMs,
     agents: cluster.reduce((sum, s) => sum + 1 + s.agentCalls, 0),
@@ -202,10 +194,12 @@ function buildRun(cluster: SessionAgg[]): RunGroup {
   };
 }
 
-function groupOverlappingSessions(sessions: SessionAgg[]): RunGroup[] {
+// One run per repo per day — no overlap sub-clustering. Two same-repo
+// sessions on the same day are the same run even with a time gap between them.
+function groupSessionsByRepoDay(sessions: SessionAgg[]): RunGroup[] {
   const byKey = new Map<string, SessionAgg[]>();
   for (const s of sessions) {
-    const key = `${s.cwd}|${dayKey(s.startMs)}`;
+    const key = `${s.repoKey}|${dayKey(s.startMs)}`;
     const list = byKey.get(key);
     if (list) list.push(s);
     else byKey.set(key, [s]);
@@ -213,20 +207,9 @@ function groupOverlappingSessions(sessions: SessionAgg[]): RunGroup[] {
 
   const runs: RunGroup[] = [];
   for (const group of byKey.values()) {
+    // Sort so Terminal 1/2/3 labels stay chronological.
     const sorted = group.slice().sort((a, b) => a.startMs - b.startMs);
-    let cluster: SessionAgg[] = [];
-    let clusterEnd = -Infinity;
-    for (const s of sorted) {
-      if (cluster.length === 0 || s.startMs <= clusterEnd) {
-        cluster.push(s);
-        clusterEnd = Math.max(clusterEnd, s.endMs);
-      } else {
-        runs.push(buildRun(cluster));
-        cluster = [s];
-        clusterEnd = s.endMs;
-      }
-    }
-    if (cluster.length) runs.push(buildRun(cluster));
+    runs.push(buildRun(sorted));
   }
   return runs.sort((a, b) => b.startMs - a.startMs);
 }
@@ -245,24 +228,19 @@ const eyebrowStyle = {
 };
 
 export default function ProfilePage() {
-  const { session, loaded } = useSupabaseSession();
-  const [email, setEmail] = useState("");
-  const [status, setStatus] = useState("");
+  const { email } = useParams<{ email: string }>();
   const [rows, setRows] = useState<EventRow[] | null>(null);
-  const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
+  const [selectedRepoKey, setSelectedRepoKey] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!session?.user.email) return;
+    if (!email) return;
     let cancelled = false;
     getSupabaseClient()
-      .from("claude_events")
+      .from("public_profile_events")
       .select(
-        "session_id,user_email,hostname,hook_event_name,tool_name,skill_name,permission_mode,cwd,content,installed_hooks,enabled_plugins,raw,client_ts"
+        "session_id,user_email,hook_event_name,tool_name,skill_name,permission_mode,repo_name,content,installed_hooks,enabled_plugins,raw,client_ts"
       )
-      // RLS on claude_events allows any authenticated user to read every row
-      // (it's a shared team pipeline) — filter to the signed-in user's own
-      // activity so this reads as a personal profile, not everyone's.
-      .eq("user_email", session.user.email)
+      .eq("user_email", email)
       .order("client_ts", { ascending: true })
       .limit(5000)
       .then(({ data, error }) => {
@@ -272,54 +250,17 @@ export default function ProfilePage() {
     return () => {
       cancelled = true;
     };
-  }, [session]);
-
-  async function handleSendMagicLink(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    setStatus("Sending...");
-    const { error } = await sendMagicLink(email);
-    setStatus(error ? `Error: ${error.message}` : "Check your email for the magic link.");
-  }
+  }, [email]);
 
   const sessions = useMemo(() => (rows ? aggregateSessions(rows) : []), [rows]);
-  const runs = useMemo(() => groupOverlappingSessions(sessions), [sessions]);
-
-  if (!loaded) return null;
-
-  if (!session) {
-    return (
-      <div className="profile-ds" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
-        <Card style={{ maxWidth: 360, width: "100%" }}>
-          <form onSubmit={handleSendMagicLink} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <h2 style={{ fontSize: "var(--text-h4)", fontWeight: "var(--weight-bold)" }}>Sign in to see your Glasshouse data</h2>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="you@example.com"
-              required
-              style={{
-                height: 44,
-                padding: "0 12px",
-                borderRadius: "var(--radius-sm)",
-                border: "1px solid var(--border-default)",
-                fontSize: "var(--text-base)",
-              }}
-            />
-            <Button>Send magic link</Button>
-            {status && <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>{status}</p>}
-          </form>
-        </Card>
-      </div>
-    );
-  }
+  const runs = useMemo(() => groupSessionsByRepoDay(sessions), [sessions]);
 
   if (rows === null) return null;
 
-  const heroRuns = sessions.length;
-  const heroMs = sessions.reduce((sum, s) => sum + s.segments.reduce((a, seg) => a + seg.ms, 0), 0);
+  const heroRuns = runs.length;
+  const heroMs = runs.reduce((sum, r) => sum + r.totalMs, 0);
   const heroHours = Math.round(heroMs / 3600000) + "h";
-  const heroRepos = new Set(sessions.map((s) => s.cwd)).size;
+  const heroRepos = new Set(sessions.map((s) => s.repoKey)).size;
 
   const allTools = mergeCounts(sessions, "toolCounts");
 
@@ -353,12 +294,12 @@ export default function ProfilePage() {
     .filter((r) => r.hook_event_name === "SessionStart" && r.installed_hooks)
     .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0];
 
-  const repoList = Array.from(new Set(sessions.map((s) => s.cwd)))
-    .map((cwd) => {
-      const repoSessions = sessions.filter((s) => s.cwd === cwd);
+  const repoList = Array.from(new Set(sessions.map((s) => s.repoKey)))
+    .map((repoKey) => {
+      const repoSessions = sessions.filter((s) => s.repoKey === repoKey);
       const hours = repoSessions.reduce((sum, s) => sum + s.segments.reduce((a, seg) => a + seg.ms, 0), 0) / 3600000;
       const lastActiveMs = Math.max(...repoSessions.map((s) => s.endMs));
-      return { cwd, name: basename(cwd), parent: parentName(cwd), runs: repoSessions.length, hours, lastActiveMs };
+      return { repoKey, name: repoKey, runs: repoSessions.length, hours, lastActiveMs };
     })
     .sort((a, b) => b.hours - a.hours);
   const maxRepoHours = Math.max(0.01, ...repoList.map((r) => r.hours));
@@ -381,9 +322,9 @@ export default function ProfilePage() {
       : [];
     if (hasEvents) legendItems.push({ key: "skill", color: "var(--teal-500)", label: "Skill invoked" });
     return {
-      key: `${run.cwd}-${run.startMs}`,
-      cwd: run.cwd,
-      repoName: basename(run.cwd),
+      key: `${run.repoKey}-${run.startMs}`,
+      repoKey: run.repoKey,
+      repoName: run.repoKey,
       metaText: `${dayLabel(run.startMs)} · ${totalMinutes} min ${isMulti ? "elapsed" : "total"}`,
       agentsLabel: `${run.agents} ${run.agents === 1 ? "agent" : "agents"}`,
       isMulti,
@@ -394,21 +335,20 @@ export default function ProfilePage() {
     };
   });
 
-  const selectedRepo = selectedCwd
+  const selectedRepo = selectedRepoKey
     ? (() => {
-        const meta = repoList.find((r) => r.cwd === selectedCwd);
-        const repoSessions = sessions.filter((s) => s.cwd === selectedCwd);
+        const meta = repoList.find((r) => r.repoKey === selectedRepoKey);
+        const repoSessions = sessions.filter((s) => s.repoKey === selectedRepoKey);
         const tools = mergeCounts(repoSessions, "toolCounts");
         const mcp: Record<string, number> = {};
         for (const [tool, count] of Object.entries(tools)) {
           const server = parseMcpServer(tool);
           if (server) mcp[server] = (mcp[server] ?? 0) + count;
         }
-        const claudeMdRow = instructionRows.find((r) => r.cwd === selectedCwd && r.content);
+        const claudeMdRow = instructionRows.find((r) => (r.repo_name ?? "(unknown repo)") === selectedRepoKey && r.content);
         return {
-          cwd: selectedCwd,
-          name: basename(selectedCwd),
-          parent: meta?.parent ?? "",
+          repoKey: selectedRepoKey,
+          name: selectedRepoKey,
           runs: meta?.runs ?? 0,
           hours: meta?.hours ?? 0,
           lastActiveMs: meta?.lastActiveMs ?? 0,
@@ -465,10 +405,10 @@ export default function ProfilePage() {
         <Card variant="tint">
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 24 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-              <Avatar name={session.user.email ?? "?"} size="lg" />
+              <Avatar name={email ?? "?"} size="lg" />
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 <h1 style={{ fontFamily: "var(--font-display)", fontWeight: "var(--weight-thin)", fontSize: "var(--text-display-md)", letterSpacing: "var(--tracking-display)", color: "var(--text-strong)" }}>
-                  {session.user.email}
+                  {email}
                 </h1>
                 <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>Glasshouse activity</p>
               </div>
@@ -509,12 +449,12 @@ export default function ProfilePage() {
                 )}
                 {recentProjectRow && (
                   <div
-                    onClick={() => recentProjectRow.cwd && setSelectedCwd(recentProjectRow.cwd)}
+                    onClick={() => setSelectedRepoKey(recentProjectRow.repo_name ?? "(unknown repo)")}
                     style={{ display: "flex", flexDirection: "column", gap: 4, paddingTop: 12, borderTop: "1px solid var(--border-subtle)", cursor: "pointer" }}
                   >
                     <span style={eyebrowStyle}>Most recently updated repo</span>
                     <p style={{ margin: 0, fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>
-                      {recentProjectRow.cwd ? basename(recentProjectRow.cwd) : "unknown"}
+                      {recentProjectRow.repo_name ?? "(unknown repo)"}
                     </p>
                     <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{formatRelative(new Date(recentProjectRow.client_ts).getTime())}</p>
                   </div>
@@ -570,7 +510,7 @@ export default function ProfilePage() {
                 {latestHookRow ? (
                   <>
                     <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                      Registered on {latestHookRow.hostname ?? "your machine"} · {formatRelative(new Date(latestHookRow.client_ts).getTime())}
+                      Registered on your machine · {formatRelative(new Date(latestHookRow.client_ts).getTime())}
                     </p>
                     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                       {Object.entries(latestHookRow.installed_hooks ?? {}).map(([eventName, matchers]) => (
@@ -623,10 +563,9 @@ export default function ProfilePage() {
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {repoList.length === 0 && <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No sessions recorded yet.</p>}
               {repoList.map((repo) => (
-                <Card key={repo.cwd} interactive onClick={() => setSelectedCwd(repo.cwd)}>
+                <Card key={repo.repoKey} interactive onClick={() => setSelectedRepoKey(repo.repoKey)}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <span style={{ fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{repo.name}</span>
-                    <span style={{ ...eyebrowStyle, flex: "0 0 auto" }}>{repo.parent}</span>
                   </div>
                   <div style={{ marginTop: 8, height: 6, width: "100%", overflow: "hidden", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)" }}>
                     <div style={{ height: "100%", borderRadius: "var(--radius-pill)", background: "var(--brand)", width: `${Math.round((repo.hours / maxRepoHours) * 100)}%` }} />
@@ -652,7 +591,7 @@ export default function ProfilePage() {
                 <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                   <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <Tag onClick={() => setSelectedCwd(run.cwd)}>{run.repoName}</Tag>
+                      <Tag onClick={() => setSelectedRepoKey(run.repoKey)}>{run.repoName}</Tag>
                       <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{run.metaText}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -723,14 +662,12 @@ export default function ProfilePage() {
 
       {selectedRepo && (
         <>
-          <div style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(20,32,31,0.4)" }} onClick={() => setSelectedCwd(null)} />
+          <div style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(20,32,31,0.4)" }} onClick={() => setSelectedRepoKey(null)} />
           <aside style={{ position: "fixed", right: 0, top: 0, zIndex: 50, height: "100%", width: "100%", maxWidth: 420, overflowY: "auto", background: "var(--surface-card)", boxShadow: "var(--shadow-xl)", padding: 32 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={eyebrowStyle}>{selectedRepo.parent}</span>
-              <Button variant="ghost" size="sm" onClick={() => setSelectedCwd(null)}>Close</Button>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end" }}>
+              <Button variant="ghost" size="sm" onClick={() => setSelectedRepoKey(null)}>Close</Button>
             </div>
             <h2 style={{ margin: "8px 0 0", fontSize: "var(--text-h2)", fontWeight: "var(--weight-regular)" }}>{selectedRepo.name}</h2>
-            <p style={{ margin: "8px 0 0", fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>{selectedRepo.cwd}</p>
             <div style={{ marginTop: 24, display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, borderRadius: "var(--radius-card)", background: "var(--surface-sunken)", padding: 16, textAlign: "center" }}>
               <StatBlock value={selectedRepo.runs} label="Runs" />
               <StatBlock value={`${selectedRepo.hours.toFixed(1)}h`} label="Hours" />
