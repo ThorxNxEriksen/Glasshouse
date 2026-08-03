@@ -1,7 +1,7 @@
 {
   "name": "glasshouse",
   "description": "Shared Claude Code usage analytics — sends session/tool/CLAUDE.md events, gated by your per-repo consent, to the shared Glasshouse Supabase project.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "hooks": {
     "SessionStart": [
       { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs\"" }] }

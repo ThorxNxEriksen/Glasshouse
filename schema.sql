@@ -10,6 +10,10 @@ CREATE TABLE IF NOT EXISTS claude_events (
   hostname text,
   hook_event_name text,
   tool_name text,
+  -- Skill invocations are PreToolUse rows with tool_name = 'Skill'; the skill's
+  -- own name comes from tool_input.skill. tool_input.args is never captured —
+  -- it is free-text user content, unlike the name (a public plugin identifier).
+  skill_name text,
   permission_mode text,
   cwd text,
   git_branch text,
@@ -17,6 +21,10 @@ CREATE TABLE IF NOT EXISTS claude_events (
   content text,
   load_reason text,
   installed_hooks jsonb,
+  -- Always-on skills (superpowers, ponytail) are injected by *plugin*
+  -- SessionStart hooks: they never appear in settings.json's "hooks" block and
+  -- produce no Skill tool call, so enabledPlugins is the only signal they ran.
+  enabled_plugins jsonb,
   raw jsonb,
   claude_md_share_level text check (claude_md_share_level in ('redacted', 'full')),
   client_ts timestamptz not null default now(),
@@ -25,6 +33,9 @@ CREATE TABLE IF NOT EXISTS claude_events (
 
 -- Enable Row Level Security
 ALTER TABLE claude_events ENABLE ROW LEVEL SECURITY;
+
+CREATE INDEX IF NOT EXISTS claude_events_skill_name_idx
+  ON claude_events (skill_name) WHERE skill_name IS NOT NULL;
 
 -- Explicit grants: don't rely on Supabase's implicit default grants to
 -- public-schema objects, which Supabase has signaled it may stop doing.
@@ -70,10 +81,11 @@ SELECT
   hostname,
   user_email,
   installed_hooks,
-  client_ts
+  client_ts,
+  enabled_plugins
 FROM claude_events
 WHERE hook_event_name = 'SessionStart'
-  AND installed_hooks IS NOT NULL;
+  AND (installed_hooks IS NOT NULL OR enabled_plugins IS NOT NULL);
 
 REVOKE ALL ON session_hooks_installed FROM anon;
 GRANT SELECT ON session_hooks_installed TO authenticated;
@@ -116,3 +128,21 @@ GROUP BY session_id, tool_name;
 
 REVOKE ALL ON session_tool_usage FROM anon;
 GRANT SELECT ON session_tool_usage TO authenticated;
+
+-- View 5: session_skill_usage - per-skill invocation counts. Same shape as
+-- session_tool_usage, one grain finer: tool_name is always 'Skill' for these
+-- rows, so skill_name is what actually distinguishes them.
+CREATE OR REPLACE VIEW session_skill_usage WITH (security_invoker = true) AS
+SELECT
+  session_id,
+  skill_name,
+  COUNT(*) AS uses,
+  MIN(client_ts) AS first_used,
+  MAX(client_ts) AS last_used
+FROM claude_events
+WHERE hook_event_name = 'PreToolUse'
+  AND skill_name IS NOT NULL
+GROUP BY session_id, skill_name;
+
+REVOKE ALL ON session_skill_usage FROM anon;
+GRANT SELECT ON session_skill_usage TO authenticated;

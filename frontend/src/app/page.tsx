@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { Session } from "@supabase/supabase-js";
+import { useState } from "react";
 import { getSupabaseClient } from "../../lib/supabaseClient";
+import { useSupabaseSession } from "../../lib/useSupabaseSession";
 import { ViewSection } from "../../components/ViewSection";
 
 const VIEW_NAMES = [
@@ -13,29 +13,9 @@ const VIEW_NAMES = [
 ] as const;
 
 export default function Home() {
-  const [session, setSession] = useState<Session | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const { session, loaded } = useSupabaseSession();
   const [email, setEmail] = useState("");
   const [status, setStatus] = useState("");
-
-  useEffect(() => {
-    const supabase = getSupabaseClient();
-
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session);
-      setLoaded(true);
-    });
-
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      setSession(newSession);
-    });
-
-    return () => {
-      subscription.unsubscribe();
-    };
-  }, []);
 
   async function handleSendMagicLink(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();

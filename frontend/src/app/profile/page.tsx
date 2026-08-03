@@ -1,267 +1,432 @@
 "use client";
 
 // Port of the "Agent Glassdoor" Claude Design mock (claude.ai/design project
-// 456c8123-11e2-4104-875b-cc9fc485b3ea, Agent Glassdoor.dc.html). This is the
-// mock's own labeled "Profile mockup" — a possible future personal-profile
-// view for Glasshouse — reproduced with its own demo data, not yet wired to
-// the real claude_events views (those don't carry per-repo claude.md text,
-// skill-invoker breakdown, or MCP call counts the mock assumes).
-import { useState } from "react";
+// 456c8123-11e2-4104-875b-cc9fc485b3ea, Agent Glassdoor.dc.html), wired to
+// the real Glasshouse claude_events data instead of the mock's demo arrays.
+//
+// A few cards had to be reinterpreted because the real schema doesn't carry
+// what the mock assumed:
+// - "Skills" is split in two, because the two kinds of skill activation are
+//   genuinely different measurements: skills Claude *invokes* (a Skill tool
+//   call, so countable per name via skill_name) and *always-on* skills that a
+//   plugin injects through a SessionStart hook (no tool call exists to count,
+//   so only presence is knowable — from enabled_plugins).
+//   The mock's you-vs-Claude split is still not tracked: a hook payload doesn't
+//   say whether the user typed /skill or Claude chose it.
+// - "Hooks" (named hooks + descriptions) isn't tracked — command strings are
+//   deliberately scrubbed to avoid leaking local paths. Shows the real
+//   registered hook events + matchers instead.
+// - "Repos" are grouped by literal cwd (not normalized to a git repo root),
+//   so a repo and a subdirectory/worktree can appear as separate entries.
+// - The status line / GitHub link in the mock were fabricated bio flavor
+//   text with no tracked equivalent — dropped in favor of the real signed-in
+//   user's email.
+import { useEffect, useMemo, useState } from "react";
 import "./ds.css";
 import { Avatar, Badge, Button, Card, StatBlock, Tag } from "./ds";
+import { getSupabaseClient } from "../../../lib/supabaseClient";
+import { useSupabaseSession } from "../../../lib/useSupabaseSession";
 
-type PermissionMode = "plan" | "chat" | "auto";
-type SessionEventType = "skill" | "compact" | "clear";
-
-interface Repo {
-  id: string;
-  org: string;
-  name: string;
-  desc: string;
-  runs: number;
-  hours: number;
-  last: string;
-  skills: string[];
-  mcp: string[];
-  claudeMd: string | null;
+interface EventRow {
+  session_id: string | null;
+  user_email: string | null;
+  hostname: string | null;
+  hook_event_name: string | null;
+  tool_name: string | null;
+  skill_name: string | null;
+  permission_mode: string | null;
+  cwd: string | null;
+  content: string | null;
+  installed_hooks: Record<string, string[]> | null;
+  enabled_plugins: string[] | null;
+  raw: Record<string, unknown> | null;
+  client_ts: string;
 }
 
-interface SessionEvent {
-  at: number;
-  type: SessionEventType;
-  label?: string;
+const MODE_COLORS: Record<string, string> = {
+  plan: "var(--lavender-500)",
+  chat: "var(--warning)",
+  default: "var(--warning)",
+  auto: "var(--success)",
+  acceptEdits: "var(--success)",
+  dontAsk: "var(--danger)",
+  bypassPermissions: "var(--danger)",
+};
+const MODE_LABELS: Record<string, string> = {
+  plan: "Plan mode",
+  chat: "Back-and-forth",
+  default: "Back-and-forth",
+  auto: "Auto mode",
+  acceptEdits: "Accept edits",
+  dontAsk: "Don't ask",
+  bypassPermissions: "Bypass permissions",
+};
+function modeColor(mode: string) {
+  return MODE_COLORS[mode] ?? "var(--grey-300)";
+}
+function modeLabel(mode: string) {
+  return MODE_LABELS[mode] ?? mode;
 }
 
-interface SessionRaw {
-  repo: string;
-  date: string;
-  start: string;
-  agents: number;
-  skills: string[];
-  segments: [PermissionMode, number][];
-  events: SessionEvent[];
+function basename(p: string) {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? p;
+}
+function parentName(p: string) {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length > 1 ? parts[parts.length - 2] : "";
+}
+
+function parseMcpServer(toolName: string): string | null {
+  const m = /^mcp__([^_]+(?:_[^_]+)*)__/.exec(toolName);
+  if (!m) return null;
+  return m[1].replace(/^claude_ai_/, "").replace(/_/g, " ");
+}
+
+function formatRelative(ms: number) {
+  const diffMin = Math.round((Date.now() - ms) / 60000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffH = Math.round(diffMin / 60);
+  if (diffH < 24) return `${diffH}h ago`;
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+function dayKey(ms: number) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+function dayLabel(ms: number) {
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+interface SessionAgg {
+  sessionId: string;
+  cwd: string;
+  startMs: number;
+  endMs: number;
+  segments: { mode: string; ms: number }[];
+  skillEventsMs: number[];
+  toolCounts: Record<string, number>;
+  skillCounts: Record<string, number>;
+  agentCalls: number;
+}
+
+function aggregateSessions(rows: EventRow[]): SessionAgg[] {
+  const bySession = new Map<string, EventRow[]>();
+  for (const row of rows) {
+    if (!row.session_id || !row.client_ts) continue;
+    const list = bySession.get(row.session_id);
+    if (list) list.push(row);
+    else bySession.set(row.session_id, [row]);
+  }
+
+  const sessions: SessionAgg[] = [];
+  for (const [sessionId, sessionRows] of bySession) {
+    sessionRows.sort((a, b) => new Date(a.client_ts).getTime() - new Date(b.client_ts).getTime());
+    const cwd = sessionRows.find((r) => r.cwd)?.cwd ?? "(unknown)";
+    const times = sessionRows.map((r) => new Date(r.client_ts).getTime());
+    const segments: { mode: string; ms: number }[] = [];
+    const skillEventsMs: number[] = [];
+    const toolCounts: Record<string, number> = {};
+    const skillCounts: Record<string, number> = {};
+    let agentCalls = 0;
+
+    for (let i = 0; i < sessionRows.length; i++) {
+      const row = sessionRows[i];
+      if (row.permission_mode && i + 1 < sessionRows.length) {
+        segments.push({ mode: row.permission_mode, ms: times[i + 1] - times[i] });
+      }
+      if (row.hook_event_name === "PreToolUse" && row.tool_name) {
+        toolCounts[row.tool_name] = (toolCounts[row.tool_name] ?? 0) + 1;
+        if (row.tool_name === "Skill") {
+          skillEventsMs.push(times[i]);
+          // skill_name is null on rows captured before it was a column — those
+          // still count as timeline events above, just not per-name below.
+          if (row.skill_name) skillCounts[row.skill_name] = (skillCounts[row.skill_name] ?? 0) + 1;
+        }
+        if (row.tool_name === "Agent") agentCalls += 1;
+      }
+    }
+
+    sessions.push({
+      sessionId,
+      cwd,
+      startMs: times[0],
+      endMs: times[times.length - 1],
+      segments,
+      skillEventsMs,
+      toolCounts,
+      skillCounts,
+      agentCalls,
+    });
+  }
+  return sessions;
 }
 
 interface Terminal {
   label: string | null;
-  offset: number;
-  duration: number;
-  segments: [PermissionMode, number][];
-  events: SessionEvent[];
+  offsetMs: number;
+  durationMs: number;
+  segments: { mode: string; ms: number }[];
+  eventsMs: number[];
 }
-
 interface RunGroup {
-  repo: string;
-  date: string;
-  startMinutes: number;
-  totalMinutes: number;
+  cwd: string;
+  startMs: number;
+  totalMs: number;
   agents: number;
-  skills: string[];
+  toolCounts: Record<string, number>;
   terminals: Terminal[];
 }
 
-const REPOS: Repo[] = [
-  { id: "proposal-engine", org: "intellishore", name: "proposal-engine", desc: "Automates proposal drafting from SharePoint case history and pricing sheets.", runs: 42, hours: 18.4, last: "Jul 27", skills: ["search-customers", "xlsx", "docx"], mcp: ["SharePoint", "Jira"], claudeMd: "Always run search-customers before drafting — never fabricate case metrics.\nCite source documents by SharePoint link.\nPricing in DKK unless the client states otherwise." },
-  { id: "design-system", org: "intellishore", name: "design-system", desc: "The @intellishore/design-system component library and Storybook.", runs: 27, hours: 11.2, last: "Jul 26", skills: ["ui-design-system", "skill-creator"], mcp: ["GitHub", "Linear"], claudeMd: "Tokens only — no raw hex, no off-scale spacing.\nPrefer the higher-level primitive over hand-rolled markup.\nEvery PR needs a Storybook entry." },
-  { id: "client-portal-api", org: "intellishore", name: "client-portal-api", desc: "Backend services for the client-facing engagement portal.", runs: 14, hours: 9.8, last: "Jul 25", skills: ["docx", "pdf"], mcp: ["Jira", "Confluence"], claudeMd: "FastAPI + SQLAlchemy conventions, explicit typing on every endpoint.\nRun pytest before marking any task done.\nNever log customer PII." },
-  { id: "dotfiles", org: "thoreriksen", name: "dotfiles", desc: "Personal shell, tmux, and Claude Code configuration.", runs: 19, hours: 6.5, last: "Jul 24", skills: [], mcp: ["GitHub"], claudeMd: null },
-  { id: "cowork-plugins", org: "thoreriksen", name: "cowork-plugins", desc: "Custom Cowork plugins for internal Intellishore workflows.", runs: 11, hours: 5.1, last: "Jul 23", skills: ["skill-creator", "create-cowork-plugin"], mcp: ["GitHub"], claudeMd: "Validate plugin.json against the schema before packaging.\nSkill names are kebab-case, one skill per directory." },
-  { id: "internal-market-intelligence", org: "intellishore", name: "internal-market-intelligence", desc: "Go-to-market intelligence platform tracking pharma companies as prospective consulting clients — surfaces regulatory, trial, leadership, and financial signals.", runs: 51, hours: 24.6, last: "Jul 28", skills: ["run", "prod-pipeline-run"], mcp: ["GitHub", "Azure"], claudeMd: "Pharma companies tracked are called accounts — never \"competitors\", even in legacy code.\nSignals must tie to a concrete entity (country, product, TA, tech); generic news is noise.\nMedallion pipeline: bronze -> silver -> gold -> platinum, no backward joins.\nWeekly digest sends Tuesday 06:00 CPH; root CLAUDE.md stays <=150 lines." },
-];
-
-const SKILLS_USAGE = [
-  { name: "superpowers:subagent-driven-development", byUser: 8, byAgent: 34 },
-  { name: "ponytail", byUser: 15, byAgent: 10 },
-  { name: "intellishore:ui-design-system", byUser: 12, byAgent: 9 },
-  { name: "andrej-karpathy-skills:karpathy-guidelines", byUser: 6, byAgent: 8 },
-];
-const SKILLS_LATEST_NAME = "ponytail";
-const SKILLS_LATEST_DATE = "Jul 29";
-const SKILLS_LATEST_URL = "https://github.com/anthropics/skills";
-
-const MCP_USAGE = [
-  { name: "Playwright", count: 38 },
-  { name: "Context7", count: 22 },
-  { name: "draw.io", count: 14 },
-];
-const MCP_LATEST = "Recently connected Context7";
-
-const HOOKS_LIST = [
-  { name: "verify-against-docs", event: "PostToolUse", desc: "Checks a change is consistent with the docs before the task is marked done.", isLatest: true },
-  { name: "block-prod-db-writes", event: "PreToolUse", desc: "Blocks any write against a production database connection." },
-  { name: "run-storybook-lint", event: "PostToolUse", desc: "Lints new components against the Storybook config." },
-  { name: "load-pricing-sheet", event: "SessionStart", desc: "Loads the latest pricing sheet into context." },
-];
-const HOOKS_LATEST = "Added verify-against-docs post-hook";
-
-const CLAUDE_MD_GLOBAL = {
-  path: "~/.claude/CLAUDE.md",
-  text: "Explicit variable naming for every Python and SQL snippet. New folders use kebab-case with zero-padded numeric prefixes (01-, 02-...). Prose by default, concise, no filler. Ask clarifying questions before diving into ambiguous requests, and flag Python best practices inline where relevant.",
-};
-const CLAUDE_MD_LATEST = "Latest: ~/.claude/CLAUDE.md — added “ask before diving into ambiguous requests” rule · Jul 29";
-const CLAUDE_MD_RECENT_REPO = { repo: "proposal-engine", date: "Jul 24", summary: "Added DKK-default pricing note" };
-
-const MODE_META: Record<PermissionMode, { label: string; color: string }> = {
-  plan: { label: "Plan mode", color: "var(--lavender-500)" },
-  chat: { label: "Back-and-forth", color: "var(--warning)" },
-  auto: { label: "Auto mode", color: "var(--success)" },
-};
-
-const EVENT_META: Record<SessionEventType, { color: string; label: (e: SessionEvent) => string }> = {
-  skill: { color: "var(--teal-500)", label: (e) => `Skill invoked · ${e.label ?? ""}` },
-  compact: { color: "var(--ink-900)", label: () => "/compact" },
-  clear: { color: "var(--danger)", label: () => "/clear" },
-};
-
-const SESSIONS: SessionRaw[] = [
-  { repo: "internal-market-intelligence", date: "Jul 28", start: "09:02", agents: 3, skills: ["prod-pipeline-run"], segments: [["plan", 9], ["chat", 14], ["auto", 20]], events: [{ at: 9, type: "skill", label: "prod-pipeline-run" }, { at: 30, type: "compact" }] },
-  { repo: "internal-market-intelligence", date: "Jul 28", start: "09:07", agents: 2, skills: ["run"], segments: [["chat", 10], ["auto", 25]], events: [{ at: 10, type: "skill", label: "run" }, { at: 33, type: "clear" }] },
-  { repo: "internal-market-intelligence", date: "Jul 21", start: "14:10", agents: 2, skills: ["run"], segments: [["plan", 5], ["chat", 10], ["auto", 16]], events: [{ at: 5, type: "skill", label: "run" }] },
-  { repo: "proposal-engine", date: "Jul 27", start: "10:00", agents: 3, skills: ["search-customers", "xlsx"], segments: [["plan", 8], ["chat", 12], ["auto", 22]], events: [{ at: 8, type: "skill", label: "search-customers" }] },
-  { repo: "design-system", date: "Jul 26", start: "11:15", agents: 1, skills: ["ui-design-system"], segments: [["plan", 5], ["chat", 6]], events: [] },
-  { repo: "client-portal-api", date: "Jul 25", start: "09:30", agents: 4, skills: ["docx"], segments: [["plan", 10], ["auto", 35]], events: [] },
-  { repo: "dotfiles", date: "Jul 24", start: "16:00", agents: 1, skills: [], segments: [["chat", 9]], events: [] },
-  { repo: "cowork-plugins", date: "Jul 23", start: "13:20", agents: 2, skills: ["skill-creator", "create-cowork-plugin"], segments: [["plan", 6], ["chat", 15], ["auto", 18]], events: [] },
-  { repo: "proposal-engine", date: "Jul 22", start: "08:45", agents: 2, skills: ["xlsx"], segments: [["plan", 4], ["auto", 26]], events: [] },
-  { repo: "design-system", date: "Jul 20", start: "15:00", agents: 1, skills: ["ui-design-system", "skill-creator"], segments: [["chat", 20], ["auto", 10]], events: [] },
-  { repo: "client-portal-api", date: "Jul 18", start: "10:10", agents: 3, skills: ["docx", "pdf"], segments: [["plan", 12], ["chat", 8], ["auto", 30]], events: [] },
-];
-
-function toMinutes(hhmm: string) {
-  const [h, m] = hhmm.split(":").map(Number);
-  return h * 60 + m;
-}
-function sessionDuration(s: SessionRaw) {
-  return s.segments.reduce((sum, [, m]) => sum + m, 0);
-}
-function dayNumber(dateStr: string) {
-  return parseInt(dateStr.replace(/\D/g, ""), 10);
+function mergeCounts(sessions: SessionAgg[], key: "toolCounts" | "skillCounts"): Record<string, number> {
+  const merged: Record<string, number> = {};
+  for (const s of sessions) {
+    for (const [name, count] of Object.entries(s[key])) {
+      merged[name] = (merged[name] ?? 0) + count;
+    }
+  }
+  return merged;
 }
 
-function buildRun(cluster: SessionRaw[]): RunGroup {
-  const overallStart = Math.min(...cluster.map((s) => toMinutes(s.start)));
-  const overallEnd = Math.max(...cluster.map((s) => toMinutes(s.start) + sessionDuration(s)));
+function buildRun(cluster: SessionAgg[]): RunGroup {
+  const startMs = Math.min(...cluster.map((s) => s.startMs));
+  const endMs = Math.max(...cluster.map((s) => s.endMs));
   return {
-    repo: cluster[0].repo,
-    date: cluster[0].date,
-    startMinutes: overallStart,
-    totalMinutes: overallEnd - overallStart,
-    agents: cluster.reduce((sum, s) => sum + s.agents, 0),
-    skills: [...new Set(cluster.flatMap((s) => s.skills))],
+    cwd: cluster[0].cwd,
+    startMs,
+    totalMs: endMs - startMs,
+    agents: cluster.reduce((sum, s) => sum + 1 + s.agentCalls, 0),
+    toolCounts: mergeCounts(cluster, "toolCounts"),
     terminals: cluster.map((s, i) => ({
       label: cluster.length > 1 ? `Terminal ${i + 1}` : null,
-      offset: toMinutes(s.start) - overallStart,
-      duration: sessionDuration(s),
+      offsetMs: s.startMs - startMs,
+      durationMs: s.endMs - s.startMs || 1,
       segments: s.segments,
-      events: s.events,
+      eventsMs: s.skillEventsMs,
     })),
   };
 }
 
-function groupOverlappingSessions(sessions: SessionRaw[]): RunGroup[] {
-  const byKey: Record<string, SessionRaw[]> = {};
-  sessions.forEach((s) => {
-    const key = s.repo + "|" + s.date;
-    (byKey[key] = byKey[key] || []).push(s);
-  });
+function groupOverlappingSessions(sessions: SessionAgg[]): RunGroup[] {
+  const byKey = new Map<string, SessionAgg[]>();
+  for (const s of sessions) {
+    const key = `${s.cwd}|${dayKey(s.startMs)}`;
+    const list = byKey.get(key);
+    if (list) list.push(s);
+    else byKey.set(key, [s]);
+  }
+
   const runs: RunGroup[] = [];
-  Object.values(byKey).forEach((group) => {
-    const sorted = group.slice().sort((a, b) => toMinutes(a.start) - toMinutes(b.start));
-    let cluster: SessionRaw[] = [];
+  for (const group of byKey.values()) {
+    const sorted = group.slice().sort((a, b) => a.startMs - b.startMs);
+    let cluster: SessionAgg[] = [];
     let clusterEnd = -Infinity;
-    sorted.forEach((s) => {
-      const start = toMinutes(s.start);
-      const end = start + sessionDuration(s);
-      if (cluster.length === 0 || start <= clusterEnd) {
+    for (const s of sorted) {
+      if (cluster.length === 0 || s.startMs <= clusterEnd) {
         cluster.push(s);
-        clusterEnd = Math.max(clusterEnd, end);
+        clusterEnd = Math.max(clusterEnd, s.endMs);
       } else {
         runs.push(buildRun(cluster));
         cluster = [s];
-        clusterEnd = end;
+        clusterEnd = s.endMs;
       }
-    });
+    }
     if (cluster.length) runs.push(buildRun(cluster));
-  });
-  return runs.sort((a, b) => dayNumber(b.date) - dayNumber(a.date) || b.startMinutes - a.startMinutes);
+  }
+  return runs.sort((a, b) => b.startMs - a.startMs);
 }
 
-const RAW_RUNS = groupOverlappingSessions(SESSIONS);
+function topEntries(counts: Record<string, number>, n: number) {
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n);
+}
+
+const eyebrowStyle = {
+  fontSize: "var(--text-2xs)",
+  letterSpacing: "var(--tracking-eyebrow)",
+  textTransform: "uppercase" as const,
+  color: "var(--text-faint)",
+};
 
 export default function ProfilePage() {
-  const [statuslineOpen, setStatuslineOpen] = useState(false);
-  const [selectedRepoId, setSelectedRepoId] = useState<string | null>(null);
+  const { session, loaded } = useSupabaseSession();
+  const [email, setEmail] = useState("");
+  const [status, setStatus] = useState("");
+  const [rows, setRows] = useState<EventRow[] | null>(null);
+  const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
 
-  const selectRepo = (id: string) => setSelectedRepoId(id);
-  const closeRepo = () => setSelectedRepoId(null);
+  useEffect(() => {
+    if (!session?.user.email) return;
+    let cancelled = false;
+    getSupabaseClient()
+      .from("claude_events")
+      .select(
+        "session_id,user_email,hostname,hook_event_name,tool_name,skill_name,permission_mode,cwd,content,installed_hooks,enabled_plugins,raw,client_ts"
+      )
+      // RLS on claude_events allows any authenticated user to read every row
+      // (it's a shared team pipeline) — filter to the signed-in user's own
+      // activity so this reads as a personal profile, not everyone's.
+      .eq("user_email", session.user.email)
+      .order("client_ts", { ascending: true })
+      .limit(5000)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        setRows(!error && data ? (data as EventRow[]) : []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session]);
 
-  const heroRuns = REPOS.reduce((s, r) => s + r.runs, 0);
-  const heroHours = Math.round(REPOS.reduce((s, r) => s + r.hours, 0)) + "h";
-  const heroRepos = REPOS.length;
+  async function handleSendMagicLink(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setStatus("Sending...");
+    const { error } = await getSupabaseClient().auth.signInWithOtp({ email });
+    setStatus(error ? `Error: ${error.message}` : "Check your email for the magic link.");
+  }
 
-  const maxSkillTotal = Math.max(...SKILLS_USAGE.map((s) => s.byUser + s.byAgent));
-  const skillBars = SKILLS_USAGE.slice()
-    .sort((a, b) => b.byUser + b.byAgent - (a.byUser + a.byAgent))
-    .map((s) => {
-      const total = s.byUser + s.byAgent;
-      return { name: s.name, barWidthPct: (total / maxSkillTotal) * 100, userPct: (s.byUser / total) * 100, agentPct: (s.byAgent / total) * 100 };
-    });
+  const sessions = useMemo(() => (rows ? aggregateSessions(rows) : []), [rows]);
+  const runs = useMemo(() => groupOverlappingSessions(sessions), [sessions]);
 
-  const maxMcpCount = Math.max(...MCP_USAGE.map((m) => m.count));
-  const mcpBars = MCP_USAGE.slice()
-    .sort((a, b) => b.count - a.count)
-    .map((m) => ({ name: m.name, count: m.count, barWidthPct: (m.count / maxMcpCount) * 100 }));
+  if (!loaded) return null;
 
-  const maxHours = Math.max(...REPOS.map((r) => r.hours));
-  const repoList = REPOS.slice()
-    .sort((a, b) => b.hours - a.hours)
-    .map((r) => ({ ...r, barPct: Math.round((r.hours / maxHours) * 100) }));
+  if (!session) {
+    return (
+      <div className="profile-ds" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
+        <Card style={{ maxWidth: 360, width: "100%" }}>
+          <form onSubmit={handleSendMagicLink} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <h2 style={{ fontSize: "var(--text-h4)", fontWeight: "var(--weight-bold)" }}>Sign in to see your Glasshouse data</h2>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              required
+              style={{
+                height: 44,
+                padding: "0 12px",
+                borderRadius: "var(--radius-sm)",
+                border: "1px solid var(--border-default)",
+                fontSize: "var(--text-base)",
+              }}
+            />
+            <Button>Send magic link</Button>
+            {status && <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>{status}</p>}
+          </form>
+        </Card>
+      </div>
+    );
+  }
 
-  const runViews = RAW_RUNS.map((run) => {
-    const repo = REPOS.find((r) => r.id === run.repo)!;
+  if (rows === null) return null;
+
+  const heroRuns = sessions.length;
+  const heroMs = sessions.reduce((sum, s) => sum + s.segments.reduce((a, seg) => a + seg.ms, 0), 0);
+  const heroHours = Math.round(heroMs / 3600000) + "h";
+  const heroRepos = new Set(sessions.map((s) => s.cwd)).size;
+
+  const allTools = mergeCounts(sessions, "toolCounts");
+  const totalToolCalls = Object.values(allTools).reduce((a, b) => a + b, 0);
+  const maxToolCount = Math.max(1, ...topEntries(allTools, 6).map(([, c]) => c));
+  const toolBars = topEntries(allTools, 6).map(([name, count]) => ({ name, count, pct: (count / maxToolCount) * 100 }));
+
+  // Invoked skills: countable, because each one is a real Skill tool call.
+  const allSkills = mergeCounts(sessions, "skillCounts");
+  const totalSkillCalls = Object.values(allSkills).reduce((a, b) => a + b, 0);
+  const untypedSkillCalls = (allTools["Skill"] ?? 0) - totalSkillCalls;
+  const maxSkillCount = Math.max(1, ...topEntries(allSkills, 8).map(([, c]) => c));
+  const skillBars = topEntries(allSkills, 8).map(([name, count]) => ({ name, count, pct: (count / maxSkillCount) * 100 }));
+
+  // Always-on skills: no tool call exists to count, so this is presence only —
+  // the enabled-plugin set from the most recent session that reported one.
+  const alwaysOnPlugins =
+    rows
+      .filter((r) => r.enabled_plugins?.length)
+      .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0]
+      ?.enabled_plugins ?? [];
+
+  const mcpCounts: Record<string, number> = {};
+  for (const [tool, count] of Object.entries(allTools)) {
+    const server = parseMcpServer(tool);
+    if (server) mcpCounts[server] = (mcpCounts[server] ?? 0) + count;
+  }
+  const maxMcpCount = Math.max(1, ...topEntries(mcpCounts, 5).map(([, c]) => c));
+  const mcpBars = topEntries(mcpCounts, 5).map(([name, count]) => ({ name, count, pct: (count / maxMcpCount) * 100 }));
+
+  const instructionRows = rows.filter((r) => r.hook_event_name === "InstructionsLoaded").sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime());
+  const globalRow = instructionRows.find((r) => r.raw?.memory_type === "User");
+  const recentProjectRow = instructionRows.find((r) => r.raw?.memory_type === "Project" || r.raw?.memory_type === undefined);
+
+  const latestHookRow = rows
+    .filter((r) => r.hook_event_name === "SessionStart" && r.installed_hooks)
+    .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0];
+
+  const repoList = Array.from(new Set(sessions.map((s) => s.cwd)))
+    .map((cwd) => {
+      const repoSessions = sessions.filter((s) => s.cwd === cwd);
+      const hours = repoSessions.reduce((sum, s) => sum + s.segments.reduce((a, seg) => a + seg.ms, 0), 0) / 3600000;
+      const lastActiveMs = Math.max(...repoSessions.map((s) => s.endMs));
+      return { cwd, name: basename(cwd), parent: parentName(cwd), runs: repoSessions.length, hours, lastActiveMs };
+    })
+    .sort((a, b) => b.hours - a.hours);
+  const maxRepoHours = Math.max(0.01, ...repoList.map((r) => r.hours));
+
+  const runViews = runs.slice(0, 20).map((run) => {
     const isMulti = run.terminals.length > 1;
-    const totalSpan = run.totalMinutes;
+    const totalSpan = run.totalMs || 1;
     const terminals = run.terminals.map((t) => ({
       label: t.label,
-      barLeftPct: (t.offset / totalSpan) * 100,
-      barWidthPct: (t.duration / totalSpan) * 100,
-      segments: t.segments.map(([mode, min]) => ({ color: MODE_META[mode].color, widthPct: (min / t.duration) * 100 })),
-      events: t.events.map((ev) => ({ color: EVENT_META[ev.type].color, leftPct: ((t.offset + ev.at) / totalSpan) * 100 })),
+      barLeftPct: (t.offsetMs / totalSpan) * 100,
+      barWidthPct: (t.durationMs / totalSpan) * 100,
+      segments: t.segments.map((seg) => ({ color: modeColor(seg.mode), widthPct: (seg.ms / t.durationMs) * 100 })),
+      events: t.eventsMs.map((atMs) => ({ leftPct: ((atMs - run.startMs) / totalSpan) * 100 })),
     }));
-    const hasEvents = run.terminals.some((t) => t.events.length > 0);
-    let legendItems: { key: string; color: string; label: string }[] = [];
-    let legendShow = false;
-    if (!isMulti) {
-      legendItems = run.terminals[0].segments.map(([mode, min], si) => ({
-        key: String(si),
-        color: MODE_META[mode].color,
-        label: `${MODE_META[mode].label} · ${min} min`,
-      }));
-      legendShow = true;
-    } else if (hasEvents) {
-      legendItems = [
-        { key: "skill", color: "var(--teal-500)", label: "Skill invoked" },
-        { key: "compact", color: "var(--ink-900)", label: "/compact" },
-        { key: "clear", color: "var(--danger)", label: "/clear" },
-      ];
-      legendShow = true;
-    }
+    const singleSegments = !isMulti ? run.terminals[0].segments : [];
+    const hasEvents = run.terminals.some((t) => t.eventsMs.length > 0);
+    const totalMinutes = Math.round(run.totalMs / 60000);
+    const legendItems = !isMulti
+      ? singleSegments.map((seg, si) => ({ key: String(si), color: modeColor(seg.mode), label: `${modeLabel(seg.mode)} · ${Math.round(seg.ms / 60000)} min` }))
+      : [];
+    if (hasEvents) legendItems.push({ key: "skill", color: "var(--teal-500)", label: "Skill invoked" });
     return {
-      key: `${run.repo}-${run.date}-${run.terminals[0].offset}`,
-      repoId: repo.id,
-      repoName: repo.name,
-      metaText: `${run.date} · ${totalSpan} min ${isMulti ? "elapsed" : "total"}`,
+      key: `${run.cwd}-${run.startMs}`,
+      cwd: run.cwd,
+      repoName: basename(run.cwd),
+      metaText: `${dayLabel(run.startMs)} · ${totalMinutes} min ${isMulti ? "elapsed" : "total"}`,
       agentsLabel: `${run.agents} ${run.agents === 1 ? "agent" : "agents"}`,
       isMulti,
       terminalsLabel: `${run.terminals.length} terminals`,
       terminals,
-      legendShow,
       legendItems,
-      skillChips: run.skills,
+      toolChips: topEntries(run.toolCounts, 4).map(([name]) => name),
     };
   });
 
-  const selectedRepo = REPOS.find((r) => r.id === selectedRepoId) ?? null;
+  const selectedRepo = selectedCwd
+    ? (() => {
+        const meta = repoList.find((r) => r.cwd === selectedCwd);
+        const repoSessions = sessions.filter((s) => s.cwd === selectedCwd);
+        const tools = mergeCounts(repoSessions, "toolCounts");
+        const mcp: Record<string, number> = {};
+        for (const [tool, count] of Object.entries(tools)) {
+          const server = parseMcpServer(tool);
+          if (server) mcp[server] = (mcp[server] ?? 0) + count;
+        }
+        const claudeMdRow = instructionRows.find((r) => r.cwd === selectedCwd && r.content);
+        return {
+          cwd: selectedCwd,
+          name: basename(selectedCwd),
+          parent: meta?.parent ?? "",
+          runs: meta?.runs ?? 0,
+          hours: meta?.hours ?? 0,
+          lastActiveMs: meta?.lastActiveMs ?? 0,
+          tools: topEntries(tools, 6).map(([name]) => name),
+          mcp: Object.keys(mcp),
+          claudeMdText: claudeMdRow?.content || "Not captured yet for this repo.",
+        };
+      })()
+    : null;
 
   return (
     <div className="profile-ds">
@@ -297,9 +462,6 @@ export default function ProfilePage() {
             C
           </span>
           <span style={{ fontSize: 15, fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>Claude runs</span>
-          <span style={{ fontSize: "var(--text-2xs)", letterSpacing: "var(--tracking-eyebrow)", textTransform: "uppercase", color: "var(--text-muted)" }}>
-            Profile mockup
-          </span>
         </div>
         <nav style={{ display: "flex", gap: 28 }}>
           <a href="#changes" style={{ fontSize: 13, color: "var(--text-body)" }}>Changes</a>
@@ -312,36 +474,12 @@ export default function ProfilePage() {
         <Card variant="tint">
           <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 24 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-              <Avatar name="Thor Eriksen" size="lg" />
+              <Avatar name={session.user.email ?? "?"} size="lg" />
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 <h1 style={{ fontFamily: "var(--font-display)", fontWeight: "var(--weight-thin)", fontSize: "var(--text-display-md)", letterSpacing: "var(--tracking-display)", color: "var(--text-strong)" }}>
-                  Thor Eriksen
+                  {session.user.email}
                 </h1>
-                <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>Consultant &middot; Analytics &amp; Automation @ Intellishore</p>
-                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                  <a href="https://github.com/thoreriksen" target="_blank" rel="noopener" style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.5 7.5 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
-                    </svg>
-                    github.com/thoreriksen
-                  </a>
-                  <Button variant="ghost" size="sm" onClick={() => setStatuslineOpen((v) => !v)}>
-                    {statuslineOpen ? "Hide status line" : "Show status line"}
-                  </Button>
-                </div>
-                {statuslineOpen && (
-                  <div style={{ marginTop: 4, borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", padding: "10px 12px", fontFamily: "var(--font-mono)", fontSize: 11, overflowX: "auto", whiteSpace: "nowrap" }}>
-                    <span style={{ color: "var(--teal-700)" }}>Sonnet &middot; high</span>
-                    <span style={{ color: "var(--text-faint)" }}> | </span>
-                    <span style={{ color: "var(--success)" }}>6% - 200k</span>
-                    <span style={{ color: "var(--text-faint)" }}> | </span>
-                    <span style={{ color: "var(--warning)" }}>5h: 56% (13:40)</span>
-                    <span style={{ color: "var(--text-faint)" }}> | </span>
-                    <span style={{ color: "var(--success)" }}>7d: 64% (Sat 05:00)</span>
-                    <span style={{ color: "var(--text-faint)" }}> | </span>
-                    <span style={{ color: "var(--lavender-600)" }}>feature/update-to-gio-system</span>
-                  </div>
-                )}
+                <p style={{ margin: 0, fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>Glasshouse activity</p>
               </div>
             </div>
             <div style={{ display: "flex", gap: 36 }}>
@@ -358,46 +496,93 @@ export default function ProfilePage() {
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 <Badge tone="brand">claude.md</Badge>
-                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{CLAUDE_MD_LATEST}</p>
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  <span style={eyebrowStyle}>Global</span>
-                  <h3 style={{ fontSize: "var(--text-base)", fontWeight: "var(--weight-bold)" }}>{CLAUDE_MD_GLOBAL.path}</h3>
-                  <p style={{ margin: 0, fontSize: "var(--text-sm)", lineHeight: "var(--leading-body)", color: "var(--text-body)" }}>{CLAUDE_MD_GLOBAL.text}</p>
+                {globalRow ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <span style={eyebrowStyle}>Global · {formatRelative(new Date(globalRow.client_ts).getTime())}</span>
+                    <h3 style={{ fontSize: "var(--text-base)", fontWeight: "var(--weight-bold)" }}>~/.claude/CLAUDE.md</h3>
+                    <p style={{ margin: 0, fontSize: "var(--text-sm)", lineHeight: "var(--leading-body)", color: "var(--text-body)", whiteSpace: "pre-line" }}>
+                      {globalRow.content || "Not captured yet — will populate after your next session."}
+                    </p>
+                  </div>
+                ) : (
+                  <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No global CLAUDE.md load recorded yet.</p>
+                )}
+                {recentProjectRow && (
+                  <div
+                    onClick={() => recentProjectRow.cwd && setSelectedCwd(recentProjectRow.cwd)}
+                    style={{ display: "flex", flexDirection: "column", gap: 4, paddingTop: 12, borderTop: "1px solid var(--border-subtle)", cursor: "pointer" }}
+                  >
+                    <span style={eyebrowStyle}>Most recently updated repo</span>
+                    <p style={{ margin: 0, fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>
+                      {recentProjectRow.cwd ? basename(recentProjectRow.cwd) : "unknown"}
+                    </p>
+                    <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{formatRelative(new Date(recentProjectRow.client_ts).getTime())}</p>
+                  </div>
+                )}
+              </div>
+            </Card>
+
+            <Card>
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <Badge tone="brand">skills</Badge>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <span style={eyebrowStyle}>Invoked</span>
+                  <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                    {totalSkillCalls} invocation{totalSkillCalls === 1 ? "" : "s"} across {Object.keys(allSkills).length} skill
+                    {Object.keys(allSkills).length === 1 ? "" : "s"}
+                  </p>
+                  {skillBars.length === 0 && (
+                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No named skill invocations recorded yet.</span>
+                  )}
+                  {skillBars.map((bar) => (
+                    <div key={bar.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                        <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
+                        <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{bar.count}</span>
+                      </div>
+                      <div style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
+                        <div style={{ height: "100%", background: "var(--lavender-500)", width: `${bar.pct}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                  {untypedSkillCalls > 0 && (
+                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>
+                      + {untypedSkillCalls} older invocation{untypedSkillCalls === 1 ? "" : "s"} recorded before skill names were captured
+                    </span>
+                  )}
                 </div>
-                <div
-                  onClick={() => selectRepo(CLAUDE_MD_RECENT_REPO.repo)}
-                  style={{ display: "flex", flexDirection: "column", gap: 4, paddingTop: 12, borderTop: "1px solid var(--border-subtle)", cursor: "pointer" }}
-                >
-                  <span style={eyebrowStyle}>Most recently updated repo</span>
-                  <p style={{ margin: 0, fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-link)" }}>{CLAUDE_MD_RECENT_REPO.repo}</p>
-                  <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{CLAUDE_MD_RECENT_REPO.summary} &middot; {CLAUDE_MD_RECENT_REPO.date}</p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 12, borderTop: "1px solid var(--border-subtle)" }}>
+                  <span style={eyebrowStyle}>Always on</span>
+                  <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                    Injected every session by plugin hooks — active, not counted
+                  </p>
+                  {alwaysOnPlugins.length === 0 ? (
+                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No enabled plugins recorded yet.</span>
+                  ) : (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {alwaysOnPlugins.map((name) => (
+                        <Tag key={name}>{name.split("@")[0]}</Tag>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </Card>
 
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                <Badge tone="accent">skills</Badge>
-                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                  Added <a href={SKILLS_LATEST_URL} target="_blank" rel="noopener">{SKILLS_LATEST_NAME}</a> on {SKILLS_LATEST_DATE}
-                </p>
-                <div style={{ display: "flex", gap: 16 }}>
-                  <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "var(--text-xs)", color: "var(--text-body)" }}>
-                    <i style={{ display: "inline-block", width: 8, height: 8, borderRadius: 9999, background: "var(--teal-500)" }} />Invoked by you
-                  </span>
-                  <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "var(--text-xs)", color: "var(--text-body)" }}>
-                    <i style={{ display: "inline-block", width: 8, height: 8, borderRadius: 9999, background: "var(--brand)" }} />Invoked by Claude
-                  </span>
-                </div>
+                <Badge tone="accent">tool usage</Badge>
+                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{totalToolCalls} tool calls across {sessions.length} sessions</p>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {skillBars.map((bar) => (
+                  {toolBars.length === 0 && <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No tool activity recorded yet.</span>}
+                  {toolBars.map((bar) => (
                     <div key={bar.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                      <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                        <span style={{ fontSize: "var(--text-xs)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{bar.name}</span>
+                        <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{bar.count}</span>
+                      </div>
                       <div style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
-                        <div style={{ height: "100%", display: "flex", width: `${bar.barWidthPct}%` }}>
-                          <div style={{ height: "100%", background: "var(--teal-500)", width: `${bar.userPct}%` }} />
-                          <div style={{ height: "100%", background: "var(--brand)", width: `${bar.agentPct}%` }} />
-                        </div>
+                        <div style={{ height: "100%", background: "var(--teal-500)", width: `${bar.pct}%` }} />
                       </div>
                     </div>
                   ))}
@@ -408,27 +593,36 @@ export default function ProfilePage() {
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 <Badge tone="warning">hooks</Badge>
-                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{HOOKS_LATEST}</p>
-                <div style={{ display: "flex", flexDirection: "column" }}>
-                  {HOOKS_LIST.map((hook) => (
-                    <div key={hook.name} style={{ display: "flex", flexDirection: "column", gap: 2, padding: "10px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{hook.name}</span>
-                        <span style={eyebrowStyle}>{hook.event}</span>
-                        {hook.isLatest && <Badge tone="warning">new</Badge>}
-                      </div>
-                      <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{hook.desc}</p>
+                {latestHookRow ? (
+                  <>
+                    <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                      Registered on {latestHookRow.hostname ?? "your machine"} · {formatRelative(new Date(latestHookRow.client_ts).getTime())}
+                    </p>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {Object.entries(latestHookRow.installed_hooks ?? {}).map(([eventName, matchers]) => (
+                        <div key={eventName} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 8, borderBottom: "1px solid var(--border-subtle)" }}>
+                          <span style={{ fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{eventName}</span>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                            {matchers.map((m, i) => <Tag key={i}>{m}</Tag>)}
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </>
+                ) : (
+                  <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No hook registration recorded yet.</p>
+                )}
               </div>
             </Card>
 
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 <Badge tone="success">mcp</Badge>
-                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{MCP_LATEST}</p>
+                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  {Object.values(mcpCounts).reduce((a, b) => a + b, 0)} MCP calls across {Object.keys(mcpCounts).length} servers
+                </p>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {mcpBars.length === 0 && <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No MCP activity recorded yet.</span>}
                   {mcpBars.map((bar) => (
                     <div key={bar.name} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
@@ -436,7 +630,7 @@ export default function ProfilePage() {
                         <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{bar.count}</span>
                       </div>
                       <div style={{ height: 10, width: "100%", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)", overflow: "hidden" }}>
-                        <div style={{ height: "100%", borderRadius: "var(--radius-pill)", background: "var(--success)", width: `${bar.barWidthPct}%` }} />
+                        <div style={{ height: "100%", borderRadius: "var(--radius-pill)", background: "var(--success)", width: `${bar.pct}%` }} />
                       </div>
                     </div>
                   ))}
@@ -453,23 +647,24 @@ export default function ProfilePage() {
               <span style={eyebrowStyle}>by time spent</span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {repoList.length === 0 && <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No sessions recorded yet.</p>}
               {repoList.map((repo) => (
-                <Card key={repo.id} interactive onClick={() => selectRepo(repo.id)}>
+                <Card key={repo.cwd} interactive onClick={() => setSelectedCwd(repo.cwd)}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <span style={{ fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{repo.name}</span>
-                    <span style={{ ...eyebrowStyle, flex: "0 0 auto" }}>{repo.org}</span>
+                    <span style={{ ...eyebrowStyle, flex: "0 0 auto" }}>{repo.parent}</span>
                   </div>
                   <div style={{ marginTop: 8, height: 6, width: "100%", overflow: "hidden", borderRadius: "var(--radius-pill)", background: "var(--surface-sunken)" }}>
-                    <div style={{ height: "100%", borderRadius: "var(--radius-pill)", background: "var(--brand)", width: `${repo.barPct}%` }} />
+                    <div style={{ height: "100%", borderRadius: "var(--radius-pill)", background: "var(--brand)", width: `${Math.round((repo.hours / maxRepoHours) * 100)}%` }} />
                   </div>
                   <div style={{ marginTop: 8, display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
                     <span>{repo.runs} runs</span>
-                    <span>{repo.hours}h</span>
+                    <span>{repo.hours.toFixed(1)}h</span>
                   </div>
                 </Card>
               ))}
             </div>
-            <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>Click a repo to see connected skills &amp; MCP servers.</p>
+            <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>Click a repo to see connected tools &amp; MCP servers.</p>
           </aside>
 
           <section id="runs" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -477,12 +672,13 @@ export default function ProfilePage() {
               <h2 style={{ fontSize: "var(--text-h4)", fontWeight: "var(--weight-bold)" }}>Recent runs</h2>
               <span style={eyebrowStyle}>{runViews.length} shown</span>
             </div>
+            {runViews.length === 0 && <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No runs recorded yet.</p>}
             {runViews.map((run) => (
               <Card key={run.key}>
                 <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                   <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <Tag onClick={() => selectRepo(run.repoId)}>{run.repoName}</Tag>
+                      <Tag onClick={() => setSelectedCwd(run.cwd)}>{run.repoName}</Tag>
                       <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>{run.metaText}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -506,6 +702,7 @@ export default function ProfilePage() {
                           {terminal.events.map((ev, ei) => (
                             <div
                               key={ei}
+                              title="Skill invoked"
                               style={{
                                 position: "absolute",
                                 top: "50%",
@@ -516,7 +713,7 @@ export default function ProfilePage() {
                                 borderRadius: 9999,
                                 boxShadow: "0 0 0 2px var(--surface-card)",
                                 left: `${ev.leftPct}%`,
-                                background: ev.color,
+                                background: "var(--teal-500)",
                               }}
                             />
                           ))}
@@ -525,7 +722,7 @@ export default function ProfilePage() {
                     ))}
                   </div>
 
-                  {run.legendShow && (
+                  {run.legendItems.length > 0 && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
                       {run.legendItems.map((item) => (
                         <span key={item.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "var(--text-xs)", color: "var(--text-body)" }}>
@@ -537,10 +734,10 @@ export default function ProfilePage() {
                   )}
 
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                    {run.skillChips.length > 0 ? (
-                      run.skillChips.map((chip) => <Tag key={chip}>{chip}</Tag>)
+                    {run.toolChips.length > 0 ? (
+                      run.toolChips.map((chip) => <Tag key={chip}>{chip}</Tag>)
                     ) : (
-                      <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>no skills activated</span>
+                      <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>no tool activity</span>
                     )}
                   </div>
                 </div>
@@ -552,39 +749,43 @@ export default function ProfilePage() {
 
       {selectedRepo && (
         <>
-          <div style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(20,32,31,0.4)" }} onClick={closeRepo} />
+          <div style={{ position: "fixed", inset: 0, zIndex: 40, background: "rgba(20,32,31,0.4)" }} onClick={() => setSelectedCwd(null)} />
           <aside style={{ position: "fixed", right: 0, top: 0, zIndex: 50, height: "100%", width: "100%", maxWidth: 420, overflowY: "auto", background: "var(--surface-card)", boxShadow: "var(--shadow-xl)", padding: 32 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <span style={eyebrowStyle}>{selectedRepo.org}</span>
-              <Button variant="ghost" size="sm" onClick={closeRepo}>Close</Button>
+              <span style={eyebrowStyle}>{selectedRepo.parent}</span>
+              <Button variant="ghost" size="sm" onClick={() => setSelectedCwd(null)}>Close</Button>
             </div>
             <h2 style={{ margin: "8px 0 0", fontSize: "var(--text-h2)", fontWeight: "var(--weight-regular)" }}>{selectedRepo.name}</h2>
-            <p style={{ margin: "8px 0 0", fontSize: "var(--text-sm)", lineHeight: "var(--leading-body)", color: "var(--text-body)" }}>{selectedRepo.desc}</p>
+            <p style={{ margin: "8px 0 0", fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>{selectedRepo.cwd}</p>
             <div style={{ marginTop: 24, display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12, borderRadius: "var(--radius-card)", background: "var(--surface-sunken)", padding: 16, textAlign: "center" }}>
               <StatBlock value={selectedRepo.runs} label="Runs" />
-              <StatBlock value={`${selectedRepo.hours}h`} label="Hours" />
-              <StatBlock value={selectedRepo.last} label="Last active" />
+              <StatBlock value={`${selectedRepo.hours.toFixed(1)}h`} label="Hours" />
+              <StatBlock value={selectedRepo.lastActiveMs ? formatRelative(selectedRepo.lastActiveMs) : "—"} label="Last active" />
             </div>
             <div style={{ marginTop: 28, display: "flex", flexDirection: "column", gap: 10 }}>
-              <span style={eyebrowStyle}>Skills connected</span>
+              <span style={eyebrowStyle}>Tools used</span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {selectedRepo.skills.length > 0 ? (
-                  selectedRepo.skills.map((s) => <Tag key={s}>{s}</Tag>)
+                {selectedRepo.tools.length > 0 ? (
+                  selectedRepo.tools.map((s) => <Tag key={s}>{s}</Tag>)
                 ) : (
-                  <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>none activated on this repo yet</span>
+                  <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>none recorded yet</span>
                 )}
               </div>
             </div>
             <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 10 }}>
               <span style={eyebrowStyle}>MCP servers connected</span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                {selectedRepo.mcp.map((m) => <Badge key={m} tone="solid">{m}</Badge>)}
+                {selectedRepo.mcp.length > 0 ? (
+                  selectedRepo.mcp.map((m) => <Badge key={m} tone="solid">{m}</Badge>)
+                ) : (
+                  <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>none recorded yet</span>
+                )}
               </div>
             </div>
             <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 10 }}>
               <span style={eyebrowStyle}>claude.md</span>
               <div style={{ borderRadius: "var(--radius-sm)", background: "var(--surface-sunken)", padding: "12px 14px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text-body)", whiteSpace: "pre-line" }}>
-                {selectedRepo.claudeMd ?? "No repo-level claude.md — inherits the global ~/.claude/CLAUDE.md."}
+                {selectedRepo.claudeMdText}
               </div>
             </div>
           </aside>
@@ -593,10 +794,3 @@ export default function ProfilePage() {
     </div>
   );
 }
-
-const eyebrowStyle = {
-  fontSize: "var(--text-2xs)",
-  letterSpacing: "var(--tracking-eyebrow)",
-  textTransform: "uppercase" as const,
-  color: "var(--text-faint)",
-};
