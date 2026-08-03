@@ -6,6 +6,14 @@
 
 MCP for Vercel/Supabase.
 
+## Deployment
+
+The dashboard is public: Vercel Authentication (`ssoProtection`) is deliberately **off**, so no login stands between a visitor and the dashboard. "Public" is the product, not an oversight — don't re-enable protection to fix a data-exposure concern.
+
+The exposure control belongs one layer down: **each user decides how much of their own data they share.** Consent is per-user and per-category (the hook already gates `enabledPlugins` on an activity consent), so the dashboard must only ever render what a user has opted into sharing. When adding a field to the dashboard or a column to the pipeline, the question is not "is this domain protected" but "has this user consented to publishing this". Anything not covered by a consent must not reach a public view.
+
+`frontend/vercel.json` pins `"framework": "nextjs"`. The Project Settings preset was "Other", which ran `next build` and then served only `frontend/public/` as static files — every app route returned a platform 404 while `/next.svg` returned 200. Keep the preset in `vercel.json`, not in dashboard state a checkout can't see.
+
 ## Capturing skill usage
 
 **Read [`docs/recording_skills.md`](docs/recording_skills.md) before touching anything that reads or reports skill data.** It documents the observed payload shapes, what is verified vs. assumed, and how to re-verify after a Claude Code upgrade.
