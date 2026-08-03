@@ -15,7 +15,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import assert from "node:assert";
-import { execFileSync } from "node:child_process";
+import http from "node:http";
+import https from "node:https";
+import { execFileSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 // Shared Glasshouse Supabase project — the publishable key is designed to be
 // public (insert-only RLS on claude_events; it cannot read anything back).
@@ -273,28 +276,114 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
 // Fire-and-forget POST
 // ---------------------------------------------------------------------------
 
-async function postEvent(config, row) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1200);
-    try {
-      await fetch(`${config.supabaseUrl}/rest/v1/claude_events`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: config.supabasePublishableKey,
-          Authorization: `Bearer ${config.supabasePublishableKey}`,
-          Prefer: "return=minimal",
-        },
-        body: JSON.stringify(row),
-        signal: controller.signal,
-      });
-    } finally {
+// node:https, not fetch(). fetch() leaves undici's connection pool holding the
+// event loop after the request settles, which is why this used to end in
+// process.exit() — and exiting mid-teardown is what tripped libuv's
+// "!(handle->flags & UV_HANDLE_CLOSING)" assertion in async.c on Windows,
+// aborting the hook on every single tool call. AbortController is no help
+// either: it rejects the promise but leaves a connecting socket open, so an
+// unreachable host stalled the hook ~11s. A plain request with agent:false has
+// no keep-alive to leak and req.destroy() genuinely cancels, so the loop drains
+// on its own and nobody has to call process.exit() at all.
+function postEvent(config, row) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      resolve();
+    };
+
+    try {
+      const body = JSON.stringify(row);
+      const url = `${config.supabaseUrl}/rest/v1/claude_events`;
+      const req = (url.startsWith("http://") ? http : https).request(
+        url,
+        {
+          method: "POST",
+          agent: false,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            apikey: config.supabasePublishableKey,
+            Authorization: `Bearer ${config.supabasePublishableKey}`,
+            Prefer: "return=minimal",
+          },
+        },
+        (res) => {
+          res.resume(); // drain, or the socket never closes
+          res.on("end", finish);
+        },
+      );
+      // network failure, non-2xx, malformed URL — no retry, no buffering.
+      req.on("error", finish);
+      req.on("close", finish);
+      timer = setTimeout(() => {
+        req.destroy();
+        finish();
+      }, 1200);
+      req.end(body);
+    } catch {
+      finish();
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Drift check between the copy that runs and the copy in the repo
+//
+// install.mjs drops a standalone copy at ~/.claude/hooks/glasshouse.mjs and
+// that is what actually executes; editing only the repo source changes nothing
+// about real telemetry. The two have silently diverged twice already. When a
+// session is inside a checkout that carries the source, say so at SessionStart
+// instead of letting it rot — see "Two copies of the hook" in CLAUDE.md.
+// ---------------------------------------------------------------------------
+
+function samePath(a, b) {
+  try {
+    // .native normalizes drive-letter and 8.3 casing on Windows
+    return fs.realpathSync.native(a) === fs.realpathSync.native(b);
   } catch {
-    // network failure, abort, non-2xx — no retry, no buffering.
+    return path.resolve(a) === path.resolve(b);
   }
+}
+
+// Where this checkout keeps the hook source, or "" if cwd isn't in one.
+// Uses the git toplevel so it resolves correctly inside a worktree too.
+function repoSourcePath(cwd) {
+  try {
+    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+    if (!top) return "";
+    const source = path.join(top, "glasshouse-plugin", "glasshouse.mjs");
+    return fs.existsSync(source) ? source : "";
+  } catch {
+    return "";
+  }
+}
+
+function hookDriftWarning(selfPath, sourcePath) {
+  if (!selfPath || !sourcePath) return null;
+  if (samePath(selfPath, sourcePath)) return null; // running the repo copy itself
+  try {
+    // Compare content, not bytes: a line-ending difference is not real drift.
+    const read = (p) => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+    if (read(selfPath) === read(sourcePath)) return null;
+  } catch {
+    return null; // unreadable either side — not our business to guess
+  }
+  return (
+    `Glasshouse hook drift: the copy that is actually running differs from this checkout's source. ` +
+    `Running "${selfPath}", source "${sourcePath}". Whichever edit is newer is not live everywhere, ` +
+    `so diff the two and keep the union rather than overwriting one with the other, then re-run ` +
+    `\`node install.mjs\` to sync. Note the installed copy is machine-wide — every session in every ` +
+    `repo shares it, so a git worktree does not isolate it.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +397,11 @@ async function sendIfConsented(eventName, payload, consent, homeDir, settingsPat
   await postEvent(config, row);
 }
 
+// Ends by simply returning — no forced exit, deliberately. Tearing the process
+// down while the HTTP socket was still closing is what aborted this hook on
+// Windows (see postEvent). Everything below is either synchronous or bounded by
+// postEvent's 1200ms timeout, so the event loop drains on its own. selfCheck
+// asserts this function never regains a forced exit.
 async function runHookMode() {
   try {
     let payload = {};
@@ -328,32 +422,36 @@ async function runHookMode() {
     if (eventName === "SessionStart") {
       const config = loadConfig(homeDir);
       const hookPath = String(process.argv[1] ?? "").split(path.sep).join("/");
+      // Drift is reported alongside any consent/email prompt, not instead of it.
+      const notices = [hookDriftWarning(fileURLToPath(import.meta.url), repoSourcePath(cwd))];
+
       if (!config) {
-        const text =
+        notices.push(
           `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
-          `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
-          `data, then run: node "${hookPath}" set-email --email "<email>". ` +
-          `Nothing is sent anywhere until that command runs.`;
-        process.stdout.write(
-          JSON.stringify({
-            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
-          }) + "\n",
+            `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
+            `data, then run: node "${hookPath}" set-email --email "<email>". ` +
+            `Nothing is sent anywhere until that command runs.`,
         );
       } else if (!consent) {
-        const text =
+        notices.push(
           `Glasshouse usage analytics has no sharing preference on file for this repo yet. ` +
-          `Ask the user via AskUserQuestion, exactly two questions: ` +
-          `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
-          `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing) — yes / no. ` +
-          `Then run: node "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
-          `Nothing is sent for this repo until that command runs.`;
-        process.stdout.write(
-          JSON.stringify({
-            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
-          }) + "\n",
+            `Ask the user via AskUserQuestion, exactly two questions: ` +
+            `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
+            `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing) — yes / no. ` +
+            `Then run: node "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
+            `Nothing is sent for this repo until that command runs.`,
         );
       } else if (consent.activity === "yes") {
         await sendIfConsented(eventName, payload, consent, homeDir, settingsPath);
+      }
+
+      const text = notices.filter(Boolean).join("\n\n");
+      if (text) {
+        process.stdout.write(
+          JSON.stringify({
+            hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: text },
+          }) + "\n",
+        );
       }
     } else if (eventName === "InstructionsLoaded") {
       if (consent && consent.claudeMd !== "none") {
@@ -371,14 +469,6 @@ async function runHookMode() {
     // any other event: no-op
   } catch {
     // a hook must never crash a real session
-  } finally {
-    // setTimeout(0), not setImmediate: exiting while a fetch()'s socket is
-    // still being torn down races undici's cleanup on Windows, tripping
-    // libuv's "!(handle->flags & UV_HANDLE_CLOSING)" assertion in async.c.
-    // setImmediate fires in libuv's "check" phase, which runs BEFORE "close
-    // callbacks" in the same loop iteration — too early. setTimeout(0) defers
-    // to a later iteration's timers phase, after close callbacks have run.
-    setTimeout(() => process.exit(0), 0);
   }
 }
 
@@ -438,7 +528,7 @@ function runSetEmailMode(argv) {
 // Self-check — assert-based, no network calls, no real files touched.
 // ---------------------------------------------------------------------------
 
-function selfCheck() {
+async function selfCheck() {
   // redactClaudeMd: keeps headings only, appends exact omitted-count line.
   const content = "# Title\nSome body text\n## Sub\nMore text here";
   const expected = [
@@ -621,8 +711,123 @@ function selfCheck() {
     assert.strictEqual("prompt_id" in leakRow.raw, false);
   }
 
+  // hookDriftWarning: only fires on a real content difference between the copy
+  // that runs and the repo source, and never on line endings alone.
+  const driftDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-drift-"));
+  try {
+    const installed = path.join(driftDir, "installed.mjs");
+    const source = path.join(driftDir, "source.mjs");
+
+    fs.writeFileSync(installed, "const a = 1;\nconst b = 2;\n");
+    fs.writeFileSync(source, "const a = 1;\nconst b = 2;\n");
+    assert.strictEqual(hookDriftWarning(installed, source), null, "identical copies must not warn");
+
+    // CRLF vs LF is not drift.
+    fs.writeFileSync(source, "const a = 1;\r\nconst b = 2;\r\n");
+    assert.strictEqual(hookDriftWarning(installed, source), null, "line endings alone must not warn");
+
+    // A real difference must warn, and must name both paths so it is actionable.
+    fs.writeFileSync(source, "const a = 1;\nconst b = 3;\n");
+    const warning = hookDriftWarning(installed, source);
+    assert.ok(warning && warning.includes(installed) && warning.includes(source), "drift must name both paths");
+
+    // Running the repo copy directly is not drift, and neither is a missing side.
+    assert.strictEqual(hookDriftWarning(source, source), null, "same file must not warn");
+    assert.strictEqual(hookDriftWarning(installed, ""), null, "no repo source means nothing to compare");
+    assert.strictEqual(hookDriftWarning(installed, path.join(driftDir, "gone.mjs")), null, "missing source must not warn");
+  } finally {
+    fs.rmSync(driftDir, { recursive: true, force: true });
+  }
+
+  // The Windows libuv abort ("!(handle->flags & UV_HANDLE_CLOSING)") that used
+  // to fire on every tool call cannot be reproduced offline — it needs a real
+  // remote socket. Loopback servers that answer instantly, answer slowly, or
+  // never answer all pass even against the old fetch()+process.exit() code, so
+  // no self-contained test catches it. Assert the invariant itself instead.
+  const noForcedExit = "must not force a process exit — it is what tripped the libuv abort on Windows";
+  assert.ok(!runHookMode.toString().includes("process.exit"), `runHookMode ${noForcedExit}`);
+  assert.ok(!postEvent.toString().includes("process.exit"), `postEvent ${noForcedExit}`);
+  // fetch()'s connection pool outlives the request, which is the only reason a
+  // forced exit ever seemed necessary. Keep postEvent on node:http/https.
+  assert.ok(!postEvent.toString().includes("fetch("), "postEvent must not use fetch() — see its comment");
+
+  await assertHookModePostsAndExits();
+
   console.log("OK");
-  process.exit(0);
+}
+
+// End-to-end smoke test of hook mode: spawns the real thing with a piped stdin
+// (how Claude Code invokes it) against a loopback server, with HOME redirected
+// at a temp dir so the user's own consent/config are never read. Covers "runs,
+// honours consent, posts exactly one row, exits 0" — NOT the libuv abort above,
+// which loopback cannot trigger. Loopback only — no outbound network.
+function assertHookModePostsAndExits() {
+  return new Promise((resolve, reject) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-exitcheck-"));
+    let received = 0;
+
+    const server = http.createServer((req, res) => {
+      received++;
+      req.resume();
+      res.writeHead(201).end();
+    });
+
+    const cleanup = () => {
+      server.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    };
+
+    server.listen(0, "127.0.0.1", () => {
+      const dir = glasshouseDir(tmpDir);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        configPath(tmpDir),
+        JSON.stringify({
+          supabaseUrl: `http://127.0.0.1:${server.address().port}`,
+          supabasePublishableKey: "selfcheck-key",
+          userEmail: "selfcheck@example.invalid",
+        }),
+      );
+      fs.writeFileSync(
+        consentPath(tmpDir),
+        JSON.stringify({ [path.resolve(tmpDir)]: { claudeMd: "none", activity: "yes" } }),
+      );
+
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+        stdio: ["pipe", "pipe", "pipe"], // piped stdin is load-bearing — a file never reproduced it
+        env: { ...process.env, HOME: tmpDir, USERPROFILE: tmpDir },
+      });
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d));
+      child.stdout.resume();
+      const killer = setTimeout(() => child.kill(), 20000);
+
+      child.on("close", (code) => {
+        clearTimeout(killer);
+        cleanup();
+        try {
+          assert.strictEqual(
+            code,
+            0,
+            `hook mode must exit 0, got ${code}. stderr: ${stderr.trim() || "(empty)"}`,
+          );
+          assert.strictEqual(received, 1, `hook mode should have posted exactly 1 row, got ${received}`);
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      child.stdin.end(
+        JSON.stringify({
+          hook_event_name: "PreToolUse",
+          cwd: tmpDir,
+          tool_name: "Bash",
+          tool_input: { command: "echo hi" },
+        }),
+      );
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------

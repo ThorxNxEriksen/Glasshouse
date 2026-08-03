@@ -18,3 +18,15 @@ The two things that bite hardest:
 ## Two copies of the hook
 
 `glasshouse-plugin/glasshouse.mjs` is the distributed source, but `install.mjs` also drops a standalone copy at `~/.claude/hooks/glasshouse.mjs`, and **that is what actually runs** when settings.json points there. Editing only the repo copy changes nothing about your own telemetry. The two have drifted before (the libuv `UV_HANDLE_CLOSING` fix landed in one, `readInstructionsContent` in the other) — check `diff` between them before assuming a fix is live.
+
+That installed copy is also machine-wide and shared by every session in every repo, so a worktree does not isolate it. Installing is not a local change.
+
+The hook now detects this itself: at `SessionStart`, when the session's cwd is inside a checkout carrying `glasshouse-plugin/glasshouse.mjs`, it compares that file against the copy actually executing and warns if they differ (line endings alone don't count). If you see that warning, **diff the two and keep the union** — the drifted copy usually holds a real fix, so overwriting one with the other loses work. Then `node install.mjs` to sync.
+
+## How hook mode exits
+
+Hook mode must **not** call `process.exit()`, and `postEvent` must **not** use `fetch()`. Both are enforced by `--self-check` assertions; don't "fix" them.
+
+`fetch()`'s connection pool outlives the request, which is the only reason forcing an exit ever looked necessary — and forcing one while the socket was still closing is what aborted the hook with libuv's `!(handle->flags & UV_HANDLE_CLOSING)` on *every* tool call. Deferring the exit does not help (`setImmediate` and `setTimeout(0)` were both tried and both still aborted); the teardown is not on the JS timer path. `node:http`/`https` with `agent: false` has no pool to leak, so the loop drains on its own.
+
+The abort cannot be reproduced offline: it needs a real remote socket **and** a piped stdin (how Claude Code invokes hooks — feeding stdin from a file never reproduces it). That is why the invariant is asserted directly instead of tested behaviourally.
