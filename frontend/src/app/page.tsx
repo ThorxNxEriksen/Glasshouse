@@ -143,7 +143,7 @@ export default function DirectoryPage() {
             </div>
             <div style={{ display: "flex", gap: 36 }}>
               <StatBlock value={totalUsers} label="People sharing activity" />
-              <StatBlock value={totalRuns} label="Total runs" />
+              <StatBlock value={totalRuns} label="Total sessions" />
             </div>
           </div>
         </Card>
@@ -167,7 +167,7 @@ export default function DirectoryPage() {
                     </span>
                     <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
                       <Badge tone="neutral">
-                        {row.run_count} run{row.run_count === 1 ? "" : "s"}
+                        {row.run_count} session{row.run_count === 1 ? "" : "s"}
                       </Badge>
                       <span style={eyebrowStyle}>{formatRelative(new Date(row.last_active).getTime())}</span>
                     </div>

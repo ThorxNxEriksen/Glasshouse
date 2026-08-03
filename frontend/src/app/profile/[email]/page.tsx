@@ -25,6 +25,7 @@
 //   text with no tracked equivalent — dropped in favor of the profile's email.
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 import "../ds.css";
 import { Avatar, Badge, Button, Card, StatBlock, Tag } from "../ds";
 import { CodeBlock } from "../CodeBlock";
@@ -188,6 +189,13 @@ interface RunGroup {
   terminals: Terminal[];
 }
 
+// Active time excludes "waiting" segments (idle gaps reclassified by the
+// IDLE_GAP_MS heuristic) — used for every aggregate that claims to measure
+// time actually spent working, not wall-clock span.
+function activeMs(session: SessionAgg): number {
+  return session.segments.filter((seg) => seg.mode !== "waiting").reduce((sum, seg) => sum + seg.ms, 0);
+}
+
 function mergeCounts(sessions: SessionAgg[], key: "toolCounts" | "skillCounts"): Record<string, number> {
   const merged: Record<string, number> = {};
   for (const s of sessions) {
@@ -294,7 +302,7 @@ export default function ProfilePage() {
   if (rows === null) return null;
 
   const heroRuns = runs.length;
-  const heroMs = runs.reduce((sum, r) => sum + r.totalMs, 0);
+  const heroMs = sessions.reduce((sum, s) => sum + activeMs(s), 0);
   const heroHours = Math.round(heroMs / 3600000) + "h";
   const heroRepos = new Set(sessions.map((s) => s.repoKey)).size;
 
@@ -333,7 +341,7 @@ export default function ProfilePage() {
   const repoList = Array.from(new Set(sessions.map((s) => s.repoKey)))
     .map((repoKey) => {
       const repoSessions = sessions.filter((s) => s.repoKey === repoKey);
-      const hours = repoSessions.reduce((sum, s) => sum + s.segments.reduce((a, seg) => a + seg.ms, 0), 0) / 3600000;
+      const hours = repoSessions.reduce((sum, s) => sum + activeMs(s), 0) / 3600000;
       const lastActiveMs = Math.max(...repoSessions.map((s) => s.endMs));
       return { repoKey, name: repoKey, runs: repoSessions.length, hours, lastActiveMs };
     })
@@ -406,7 +414,7 @@ export default function ProfilePage() {
           borderBottom: "1px solid var(--border-subtle)",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <Link href="/" style={{ display: "flex", alignItems: "center", gap: 12, textDecoration: "none" }}>
           <span
             style={{
               display: "flex",
@@ -424,7 +432,7 @@ export default function ProfilePage() {
             C
           </span>
           <span style={{ fontSize: 15, fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>Claude runs</span>
-        </div>
+        </Link>
         <nav style={{ display: "flex", gap: 28 }}>
           <a href="#changes" style={{ fontSize: 13, color: "var(--text-body)" }}>Changes</a>
           <a href="#repos" style={{ fontSize: 13, color: "var(--text-body)" }}>Repos</a>

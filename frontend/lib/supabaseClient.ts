@@ -22,8 +22,8 @@ export function getSupabaseClient(): SupabaseClient {
 // localhost. Pinning Site URL to production alone would just invert the bug
 // and break local development, so send the user back to wherever they
 // actually asked to sign in from: origin keeps dev/preview/production
-// working off one config, and pathname returns them to / or /profile rather
-// than always the root.
+// working off one config, and pathname returns them to wherever they were
+// (e.g. / or /profile/<email>) rather than always the root.
 //
 // Supabase only honours this if the URL matches the Redirect URLs allow list
 // (Auth -> URL Configuration); anything else silently falls back to Site URL.

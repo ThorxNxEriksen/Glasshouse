@@ -2,10 +2,8 @@
 // `plugin:skill-name` skill_name) to the plugin's GitHub repo, so the
 // skills-invoked bars can link out to source instead of showing plain text.
 //
-// Placeholder URLs — these are not real repo links yet. Fill in the actual
-// GitHub URLs before shipping this to users.
-export const PLUGIN_GITHUB_URLS: Record<string, string> = {
-  ponytail: "https://github.com/REPLACE_ME/ponytail",
-  impeccable: "https://github.com/REPLACE_ME/impeccable",
-  superpowers: "https://github.com/REPLACE_ME/superpowers",
-};
+// Empty until real GitHub URLs are known — unmapped prefixes render as plain
+// text (see skillNameNode), never a guessed link, so an empty map is safe to
+// ship. Add real entries here as they're confirmed, e.g.:
+// ponytail: "https://github.com/<org>/ponytail",
+export const PLUGIN_GITHUB_URLS: Record<string, string> = {};
