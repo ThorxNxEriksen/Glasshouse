@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { getSupabaseClient } from "../../lib/supabaseClient";
+import { getSupabaseClient, sendMagicLink } from "../../lib/supabaseClient";
 import { useSupabaseSession } from "../../lib/useSupabaseSession";
 import { ViewSection } from "../../components/ViewSection";
 
@@ -20,7 +20,7 @@ export default function Home() {
   async function handleSendMagicLink(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setStatus("Sending...");
-    const { error } = await getSupabaseClient().auth.signInWithOtp({ email });
+    const { error } = await sendMagicLink(email);
     setStatus(error ? `Error: ${error.message}` : "Check your email for the magic link.");
   }
 

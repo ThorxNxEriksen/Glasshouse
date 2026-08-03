@@ -24,7 +24,7 @@
 import { useEffect, useMemo, useState } from "react";
 import "./ds.css";
 import { Avatar, Badge, Button, Card, StatBlock, Tag } from "./ds";
-import { getSupabaseClient } from "../../../lib/supabaseClient";
+import { getSupabaseClient, sendMagicLink } from "../../../lib/supabaseClient";
 import { useSupabaseSession } from "../../../lib/useSupabaseSession";
 
 interface EventRow {
@@ -282,7 +282,7 @@ export default function ProfilePage() {
   async function handleSendMagicLink(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setStatus("Sending...");
-    const { error } = await getSupabaseClient().auth.signInWithOtp({ email });
+    const { error } = await sendMagicLink(email);
     setStatus(error ? `Error: ${error.message}` : "Check your email for the magic link.");
   }
 
