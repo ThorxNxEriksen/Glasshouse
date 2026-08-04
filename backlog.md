@@ -99,9 +99,30 @@ double-counting, but a viewer can't tell that and it reads as a bug. Either dist
 them (`Supabase (claude.ai)` vs `supabase (local)`) or merge them deliberately; the
 current middle ground is the only wrong answer.
 
-## 6. `public_user_directory` ignores activity consent
+## 6. Reverse the consent model: activity is the price of entry, CLAUDE.md is the option
 
-It lists any user with a non-null `user_email` from *any* event. `InstructionsLoaded`
-rows carry `user_email` gated only on `claudeMd` sharing, so someone who shares their
-CLAUDE.md but declines activity sharing still appears with a `run_count`. Already
-written up in `docs/recording_skills.md` §3.
+**Decided 2026-08-04.** Today there are two independent per-repo consents — `claudeMd`
+(none/redacted/full) and `activity` (yes/no) — and they are the wrong way round.
+Activity data is tool names, skill names and timings. CLAUDE.md is free text that can
+carry client names, personal notes, or something a user pasted without thinking. The
+sensitive one is the one currently allowed to ride along beside an activity opt-out.
+
+**Target model:** installing Glasshouse *is* the activity consent — someone who doesn't
+want their activity shared shouldn't install it. CLAUDE.md stays optional and hideable,
+and becomes the only question at first run (none / redacted / full). That deletes the
+`consent.activity === "yes"` gates in `glasshouse.mjs` and the matching nulling of
+`permission_mode`, `repo_name`, `enabled_plugins` and `always_on_skills` in `buildRow`.
+
+**This subsumes the original item 6** (`public_user_directory` lists any user with a
+non-null `user_email` from *any* event, so a claudeMd-only user appears with a
+`run_count` — `docs/recording_skills.md` §3). Same root cause: `InstructionsLoaded` is
+gated on `claudeMd` while the other three events are gated on `activity`, so
+claudeMd-only rows leak activity-shaped facts. Verified during the aggregation work:
+1 of 43 sessions for the only current user is built purely from `InstructionsLoaded`
+rows, which is why `public_session_summary` counts it. Once activity is mandatory that
+asymmetry cannot arise and no per-view filter is needed.
+
+**Do not skip:** a consent record already saying `activity: no` was a promise. Changing
+the gate does not change what those users agreed to — honour existing records or re-ask
+before their activity starts flowing. Only new installs get the new model by default.
+Latent-only today: the sole user has activity consent.
