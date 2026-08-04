@@ -24,18 +24,32 @@ grain is the bug, not the limit.
 | `latestHookRow`, latest `enabled_plugins` / `always_on_skills` | latest snapshot per user |
 | `instructionRows` → CLAUDE.md viewer | latest content row per user, and per repo |
 
-**Shape.** Three public views, following the existing `public_*` conventions (explicit
+**Two grains, and they are not interchangeable.** Session rows drive the runs timeline;
+the overall per-user numbers (hero stats, skills / MCP / tools cards) are user-grain and
+should be rolled up as such rather than summed in the browser from session rows. This is
+the same split the home page already gets right with `public_tool_totals` /
+`public_skill_totals` / `public_plugin_adoption` — the profile page is the one still
+doing it client-side from raw events.
+
+**Shape.** Four public views, following the existing `public_*` conventions (explicit
 column whitelist, `REVOKE ALL` then `GRANT SELECT TO anon, authenticated`, and the same
 consent gating — see the comment above `public_profile_events`):
 
+- `public_user_totals` — one row per user: `tool_counts` / `skill_counts` as `jsonb`,
+  `session_count`, `active_ms`, `repo_count`, `first_seen`, `last_seen`. Drives the hero
+  stats and the skills / MCP / tools cards, at their real grain.
 - `public_session_summary` — one row per (`user_email`, `session_id`): `repo_name`,
-  `started_at`, `ended_at`, `active_ms`, mode segments as `jsonb`, `tool_counts` and
-  `skill_counts` as `jsonb`, `agent_calls`. Replaces `aggregateSessions` wholesale.
+  `started_at`, `ended_at`, `active_ms`, mode segments as `jsonb`, `agent_calls`, plus
+  per-session `tool_counts` / `skill_counts`. Drives the runs timeline; carrying the
+  counts here lets the repo drill-down re-aggregate by repo without a fifth view.
 - `public_user_snapshot` — latest `installed_hooks`, `enabled_plugins`,
   `always_on_skills` per user, from the newest `SessionStart`. Folds in the three
   "latest row that reported one" scans the client does today.
 - `public_claude_md_latest` — newest `InstructionsLoaded` content per (user, scope), for
   the global + per-repo viewer.
+
+MCP counts are derived from `tool_name` prefixes, not stored — keep that derivation in
+one place if it moves server-side, and see item 5 first.
 
 **Carry over, don't lose:** the mode-segment maths moves into SQL as
 `lead(client_ts) over (partition by session_id order by client_ts)`, with the
@@ -48,14 +62,15 @@ tool totals but not per-name, exactly as `aggregateSessions` does now.
 Once this lands, `public_profile_events` should have no remaining consumer. Drop it
 rather than leave a raw-event view exposed.
 
-## 2. Time-windowed views ("last week", not just lifetime)
+## 2. Time-windowed views ("last week", not just lifetime) — deferred
 
-Wanted regardless of #1, and cheap once session rows exist: filter or group
-`public_session_summary` by period so the dashboard can show "last 7 days" alongside
-all-time. Do this **after** #1 — windowing raw events would just re-create the
-1000-row problem with extra steps.
+**Explicitly not wanted yet** (decided 2026-08-04); lifetime figures are enough for now.
+Recorded because it is the obvious next ask once #1 lands, and cheap at that point:
+filter or group `public_session_summary` by period to show "last 7 days" alongside
+all-time. Do it **after** #1 — windowing raw events would just re-create the 1000-row
+problem with extra steps.
 
-Until it exists, any figure labelled as a total should say what it actually covers.
+Until then, any figure labelled as a total should say what it actually covers.
 
 ## 3. `install.mjs` bare run wipes Supabase credentials
 
@@ -74,7 +89,17 @@ included, while every other identifying field (`permission_mode`, `repo_name`,
 edit away, and `sanitizeRaw` already deletes `transcript_path` for exactly this reason.
 Gate it on activity consent, or reduce it at capture. See `docs/recording_skills.md` §9.
 
-## 5. `public_user_directory` ignores activity consent
+## 5. Two MCP servers render as near-identical labels
+
+`parseMcpServer` (`frontend/lib/mcp.ts`) strips the `claude_ai_` prefix, so the
+claude.ai-hosted server and a local one of the same name collapse to labels differing
+only by case — the MCP card shows `Supabase` (131 calls) beside `supabase` (25), and
+`Vercel` (21) beside `vercel` (9). They are genuinely different servers, so this is not
+double-counting, but a viewer can't tell that and it reads as a bug. Either distinguish
+them (`Supabase (claude.ai)` vs `supabase (local)`) or merge them deliberately; the
+current middle ground is the only wrong answer.
+
+## 6. `public_user_directory` ignores activity consent
 
 It lists any user with a non-null `user_email` from *any* event. `InstructionsLoaded`
 rows carry `user_email` gated only on `claudeMd` sharing, so someone who shares their
