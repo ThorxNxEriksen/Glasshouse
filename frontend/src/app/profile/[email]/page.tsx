@@ -56,6 +56,8 @@ interface UserTotals {
 }
 interface UserSnapshot {
   installed_hooks: Record<string, string[]> | null;
+  // client_ts of the same row installed_hooks came from — null iff installed_hooks is.
+  installed_hooks_ts: string | null;
   enabled_plugins: string[] | null;
   // One entry per plugin that injects a skill at SessionStart — a strict subset of
   // enabled_plugins. skill is null when the name couldn't be inferred safely.
@@ -279,6 +281,7 @@ export default function ProfilePage() {
   const enabledPlugins = snapshot?.enabled_plugins ?? [];
   const alwaysOnSkills = snapshot?.always_on_skills ?? [];
   const installedHooks = snapshot?.installed_hooks ?? null;
+  const installedHooksTs = snapshot?.installed_hooks_ts ?? null;
 
   const mcpCounts: Record<string, number> = {};
   for (const [tool, count] of Object.entries(allTools)) {
@@ -512,7 +515,7 @@ export default function ProfilePage() {
                 {installedHooks ? (
                   <>
                     <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                      Registered on your machine
+                      Registered on your machine{installedHooksTs && ` · ${formatRelative(new Date(installedHooksTs).getTime())}`}
                     </p>
                     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                       {Object.entries(installedHooks).map(([eventName, matchers]) => (
