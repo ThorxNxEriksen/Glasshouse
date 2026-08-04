@@ -289,8 +289,15 @@ export default function ProfilePage() {
         "session_id,user_email,hook_event_name,tool_name,skill_name,permission_mode,repo_name,content,installed_hooks,enabled_plugins,raw,client_ts"
       )
       .eq("user_email", email)
-      .order("client_ts", { ascending: true })
-      .limit(5000)
+      // PostgREST caps every response at 1000 rows regardless of what's
+      // requested here (confirmed via Content-Range on the live project) —
+      // ascending order meant a growing table only ever returned its OLDEST
+      // rows, silently dropping all recent activity. Descending gets the
+      // newest window instead; downstream aggregation re-sorts per-session
+      // so order here doesn't otherwise matter.
+      .order("client_ts", { ascending: false })
+      // To match PostgREST's db-max-rows setting
+      .limit(1000)
       .then(({ data, error }) => {
         if (cancelled) return;
         setRows(!error && data ? (data as EventRow[]) : []);
