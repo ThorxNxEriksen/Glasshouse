@@ -272,7 +272,11 @@ const eyebrowStyle = {
 };
 
 export default function ProfilePage() {
-  const { email } = useParams<{ email: string }>();
+  const { email: rawEmail } = useParams<{ email: string }>();
+  // useParams() on the client doesn't decode the segment the way the
+  // server-side `params` prop does, so an encodeURIComponent'd link (e.g.
+  // "%40" for "@") arrives here still encoded.
+  const email = rawEmail ? decodeURIComponent(rawEmail) : rawEmail;
   const [rows, setRows] = useState<EventRow[] | null>(null);
   const [selectedRepoKey, setSelectedRepoKey] = useState<string | null>(null);
 
