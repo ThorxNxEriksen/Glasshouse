@@ -333,3 +333,37 @@ LEFT JOIN tools ON tools.session_id = b.session_id
 LEFT JOIN skills ON skills.session_id = b.session_id;
 REVOKE ALL ON public_session_summary FROM anon, authenticated;
 GRANT SELECT ON public_session_summary TO anon, authenticated;
+
+-- Per-user rollups built on public_session_summary, not claude_events, so the
+-- idle-time rule stays defined in exactly one place.
+--
+-- session_count and repo_day_run_count are deliberately different numbers:
+-- session_count counts sessions (public_session_summary rows), while
+-- repo_day_run_count counts distinct (repo, UTC day) pairs -- the frontend
+-- confusingly calls both "runs" (heroRuns vs repoList[].runs); this view
+-- keeps the names distinct instead of collapsing them.
+CREATE OR REPLACE VIEW public_user_totals AS
+WITH per_name AS (
+  SELECT user_email, key AS name, sum(value::bigint) AS n, 'tool' AS kind
+  FROM public_session_summary, jsonb_each_text(tool_counts) GROUP BY 1, 2
+  UNION ALL
+  SELECT user_email, key AS name, sum(value::bigint) AS n, 'skill' AS kind
+  FROM public_session_summary, jsonb_each_text(skill_counts) GROUP BY 1, 2
+)
+SELECT s.user_email,
+       count(*) AS session_count,
+       -- Matches the frontend's UTC dayKey(); a local-time cast would differ.
+       count(DISTINCT (coalesce(s.repo_name, '(unknown repo)'),
+                       (s.started_at AT TIME ZONE 'UTC')::date)) AS repo_day_run_count,
+       count(DISTINCT coalesce(s.repo_name, '(unknown repo)')) AS repo_count,
+       coalesce(sum(s.active_ms), 0)::bigint AS active_ms,
+       coalesce((SELECT jsonb_object_agg(name, n) FROM per_name p
+                 WHERE p.user_email = s.user_email AND p.kind = 'tool'), '{}'::jsonb) AS tool_counts,
+       coalesce((SELECT jsonb_object_agg(name, n) FROM per_name p
+                 WHERE p.user_email = s.user_email AND p.kind = 'skill'), '{}'::jsonb) AS skill_counts,
+       min(s.started_at) AS first_seen,
+       max(s.ended_at) AS last_seen
+FROM public_session_summary s
+GROUP BY s.user_email;
+REVOKE ALL ON public_user_totals FROM anon, authenticated;
+GRANT SELECT ON public_user_totals TO anon, authenticated;
