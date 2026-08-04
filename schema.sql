@@ -395,16 +395,25 @@ FROM emails e;
 REVOKE ALL ON public_user_snapshot FROM anon, authenticated;
 GRANT SELECT ON public_user_snapshot TO anon, authenticated;
 
--- Newest CLAUDE.md per (user, memory_type, repo). memory_type comes out of raw
--- as a plain column so raw itself never reaches a public view.
+-- Newest CLAUDE.md per user: one row per repo for Project-scope files, but a
+-- single row for User-scope (the global ~/.claude/CLAUDE.md is not
+-- repo-scoped -- it gets re-logged once per session tagged with whichever
+-- repo that session happened to be in, so keying by repo_name for it would
+-- fragment one file into N stale-or-fresh copies and let an unordered
+-- consumer surface an old one). memory_type comes out of raw as a plain
+-- column so raw itself never reaches a public view.
 CREATE OR REPLACE VIEW public_claude_md_latest AS
-SELECT DISTINCT ON (user_email, coalesce(raw->>'memory_type', 'Project'), coalesce(repo_name, '(unknown repo)'))
+SELECT DISTINCT ON (user_email, coalesce(raw->>'memory_type', 'Project'),
+                     CASE WHEN coalesce(raw->>'memory_type', 'Project') = 'User'
+                          THEN NULL ELSE coalesce(repo_name, '(unknown repo)') END)
        user_email,
        coalesce(raw->>'memory_type', 'Project') AS memory_type,
        repo_name, content, client_ts
 FROM claude_events
 WHERE hook_event_name = 'InstructionsLoaded' AND content IS NOT NULL AND user_email IS NOT NULL
 ORDER BY user_email, coalesce(raw->>'memory_type', 'Project'),
-         coalesce(repo_name, '(unknown repo)'), client_ts DESC;
+         CASE WHEN coalesce(raw->>'memory_type', 'Project') = 'User'
+              THEN NULL ELSE coalesce(repo_name, '(unknown repo)') END,
+         client_ts DESC;
 REVOKE ALL ON public_claude_md_latest FROM anon, authenticated;
 GRANT SELECT ON public_claude_md_latest TO anon, authenticated;
