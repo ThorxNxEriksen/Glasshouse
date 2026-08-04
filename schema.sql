@@ -390,7 +390,15 @@ SELECT e.user_email,
        (SELECT always_on_skills FROM claude_events c
         WHERE c.user_email = e.user_email
           AND jsonb_array_length(coalesce(c.always_on_skills, '[]'::jsonb)) > 0
-        ORDER BY c.client_ts DESC LIMIT 1) AS always_on_skills
+        ORDER BY c.client_ts DESC LIMIT 1) AS always_on_skills,
+       -- Same row as installed_hooks above (identical predicate/order), just
+       -- projecting client_ts instead -- lets the "· X ago" label use the
+       -- timestamp of the row the hooks actually came from. Appended last so
+       -- CREATE OR REPLACE VIEW can add it without a DROP.
+       (SELECT c.client_ts FROM claude_events c
+        WHERE c.user_email = e.user_email AND c.hook_event_name = 'SessionStart'
+          AND c.installed_hooks IS NOT NULL
+        ORDER BY c.client_ts DESC LIMIT 1) AS installed_hooks_ts
 FROM emails e;
 REVOKE ALL ON public_user_snapshot FROM anon, authenticated;
 GRANT SELECT ON public_user_snapshot TO anon, authenticated;
