@@ -294,10 +294,9 @@ export default function ProfilePage() {
       // ascending order meant a growing table only ever returned its OLDEST
       // rows, silently dropping all recent activity. Descending gets the
       // newest window instead; downstream aggregation re-sorts per-session
-      // so order here doesn't otherwise matter. Limit is pinned to the real
-      // 1000-row ceiling rather than some larger number, since anything
-      // above it would be silently truncated anyway.
+      // so order here doesn't otherwise matter.
       .order("client_ts", { ascending: false })
+      // To match PostgREST's db-max-rows setting
       .limit(1000)
       .then(({ data, error }) => {
         if (cancelled) return;
