@@ -305,6 +305,7 @@ export default function ProfilePage() {
         if (cancelled) return;
         setRows(!error && data ? (data as EventRow[]) : []);
       });
+
     return () => {
       cancelled = true;
     };
