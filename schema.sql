@@ -251,3 +251,85 @@ FROM latest_session_start, LATERAL jsonb_array_elements(always_on_skills) AS ent
 GROUP BY 1, 2 ORDER BY user_count DESC;
 REVOKE ALL ON public_always_on_adoption FROM anon, authenticated;
 GRANT SELECT ON public_always_on_adoption TO anon, authenticated;
+
+-- public_session_summary: per-session rollup that replaces the client-side
+-- aggregateSessions/mergeSegments/activeMs trio in
+-- frontend/src/app/profile/[email]/page.tsx. Reproduces two behaviours of
+-- that JS that are easy to drop: (a) adjacent same-mode segments are merged
+-- (the "islands" trick below), and (b) repo_name is the FIRST non-null value
+-- in chronological order, not the min.
+CREATE OR REPLACE VIEW public_session_summary AS
+WITH ev AS (
+  SELECT user_email, session_id, repo_name, permission_mode, hook_event_name,
+         tool_name, skill_name, client_ts,
+         lead(client_ts) OVER (PARTITION BY session_id ORDER BY client_ts) AS next_ts
+  FROM claude_events
+  WHERE session_id IS NOT NULL AND user_email IS NOT NULL
+),
+-- Gaps longer than the idle threshold are the user stepping away, not time
+-- spent in that mode. Same rule as IDLE_GAP_MS in the frontend.
+seg_raw AS (
+  SELECT session_id, client_ts,
+         CASE WHEN (extract(epoch FROM (next_ts - client_ts)) * 1000) > 180000
+              THEN 'waiting' ELSE permission_mode END AS mode,
+         (extract(epoch FROM (next_ts - client_ts)) * 1000)::bigint AS ms
+  FROM ev
+  WHERE permission_mode IS NOT NULL AND next_ts IS NOT NULL
+),
+-- Islands trick: row_number() over the partition minus row_number() over the
+-- partition-plus-mode is constant across a run of consecutive same-mode rows
+-- and changes whenever the mode changes, so grouping by it merges adjacent
+-- same-mode segments (mirrors the client's mergeSegments).
+islands AS (
+  SELECT *,
+         row_number() OVER (PARTITION BY session_id ORDER BY client_ts)
+       - row_number() OVER (PARTITION BY session_id, mode ORDER BY client_ts) AS grp
+  FROM seg_raw
+),
+merged AS (
+  SELECT session_id, mode, sum(ms) AS ms, min(client_ts) AS seg_start
+  FROM islands GROUP BY session_id, mode, grp
+),
+seg AS (
+  SELECT session_id,
+         jsonb_agg(jsonb_build_object('mode', mode, 'ms', ms) ORDER BY seg_start) AS segments,
+         coalesce(sum(ms) FILTER (WHERE mode <> 'waiting'), 0)::bigint AS active_ms
+  FROM merged GROUP BY session_id
+),
+tools AS (
+  SELECT session_id,
+         jsonb_object_agg(tool_name, n) AS tool_counts,
+         coalesce(sum(n) FILTER (WHERE tool_name = 'Agent'), 0)::bigint AS agent_calls
+  FROM (SELECT session_id, tool_name, count(*) AS n FROM claude_events
+        WHERE hook_event_name = 'PreToolUse' AND tool_name IS NOT NULL
+        GROUP BY session_id, tool_name) t
+  GROUP BY session_id
+),
+-- skill_name is null on rows captured before 2026-08-03; those still count in
+-- tool_counts as 'Skill' but cannot be counted per name.
+skills AS (
+  SELECT session_id, jsonb_object_agg(skill_name, n) AS skill_counts
+  FROM (SELECT session_id, skill_name, count(*) AS n FROM claude_events
+        WHERE hook_event_name = 'PreToolUse' AND skill_name IS NOT NULL
+        GROUP BY session_id, skill_name) s
+  GROUP BY session_id
+),
+base AS (
+  SELECT user_email, session_id,
+         (array_agg(repo_name ORDER BY client_ts) FILTER (WHERE repo_name IS NOT NULL))[1] AS repo_name,
+         min(client_ts) AS started_at, max(client_ts) AS ended_at
+  FROM ev GROUP BY user_email, session_id
+)
+SELECT b.user_email, b.session_id, b.repo_name, b.started_at, b.ended_at,
+       coalesce(seg.active_ms, 0) AS active_ms,
+       (extract(epoch FROM (b.ended_at - b.started_at)) * 1000)::bigint AS wallclock_ms,
+       coalesce(seg.segments, '[]'::jsonb) AS segments,
+       coalesce(tools.tool_counts, '{}'::jsonb) AS tool_counts,
+       coalesce(skills.skill_counts, '{}'::jsonb) AS skill_counts,
+       coalesce(tools.agent_calls, 0) AS agent_calls
+FROM base b
+LEFT JOIN seg ON seg.session_id = b.session_id
+LEFT JOIN tools ON tools.session_id = b.session_id
+LEFT JOIN skills ON skills.session_id = b.session_id;
+REVOKE ALL ON public_session_summary FROM anon, authenticated;
+GRANT SELECT ON public_session_summary TO anon, authenticated;
