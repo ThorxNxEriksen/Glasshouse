@@ -105,3 +105,74 @@ It lists any user with a non-null `user_email` from *any* event. `InstructionsLo
 rows carry `user_email` gated only on `claudeMd` sharing, so someone who shares their
 CLAUDE.md but declines activity sharing still appears with a `run_count`. Already
 written up in `docs/recording_skills.md` §3.
+
+---
+
+Items 7–12 are carried over from `PLAN.md` (removed 2026-08-04 — every design
+section in it was built, and its auth model contradicted the public dashboard;
+see git history). Longer horizon than the above, not newer.
+
+## 7. Authentication — planned
+
+Intended, not merely deferred. Scope undecided; **the constraint is that auth is
+additive.** It must not become a reason to gate the public views — `CLAUDE.md` is
+explicit that no login between visitor and dashboard is the product.
+
+Already in the tree and **not dead code — do not clean it up**: the
+`authenticated`-granted views in `schema.sql` (`claude_md_session`,
+`permission_mode_summary`, `session_tool_usage`, `session_skill_usage`,
+`session_hooks_installed`), read by nothing today; plus `sendMagicLink` in
+`frontend/lib/supabaseClient.ts` and `frontend/lib/useSupabaseSession.ts`, both
+unreferenced by any page. The `emailRedirectTo` comment there records an
+already-debugged bug.
+
+Decide *what sign-in is for* before building the flow — the mechanism is solved.
+Candidates: owner-only view of your own data, a consent-management UI, and #8.
+
+## 8. Per-user retroactive visibility controls
+
+Withdrawing your own already-sent rows, beyond the per-repo consent decision made
+before anything is sent. Deferred because consent already stops unwanted data at
+the source; more plausible now that profiles are publicly browsable by email.
+Largely blocked on #7 — withdrawing your rows requires proving which are yours.
+
+## 9. Smarter CLAUDE.md redaction
+
+`redacted` is headings-only plus a line/char count: a structural summary, not
+PII-grade scrubbing. Known ceiling, accepted deliberately. Upgrade to
+secret/pattern scrubbing only if headings-only proves too thin or too revealing.
+
+## 10. Local buffering / retry queue for hook POSTs
+
+Hook POSTs go straight to PostgREST with a short abort timeout; offline or failed
+sends are dropped. Deferred because a failed POST must never interrupt a session
+and a retry queue is more machinery than the data is worth. Revisit only if gaps
+visibly distort the dashboard.
+
+## 11. OTel Collector
+
+Not used; hooks POST directly to PostgREST. A documented alternative only if
+hook-based permission-mode diffing proves too coarse.
+
+## 12. Per-session work-type classification
+
+Bucket sessions as build / debug / refactor / analyse / plan / prototype / docs —
+taxonomy borrowed from Claude Code's built-in `/team-onboarding`.
+
+**Don't copy its method.** That command classifies from each session's *first user
+message*; free-text prompts are exactly what `sanitizeRaw` refuses to transmit, and
+a label inferred from text we never published is covered by no consent category.
+The version that fits is a view over the `tool_name` sequence already stored —
+Edit/Write-heavy → build, Read/Grep with no writes → plan, repeated Read→Edit on
+one file → debug. Weak proxy: it will misread sessions that plan first, build
+second. Drop the idea if the buckets read as noise.
+
+## 13. "Pull from target before opening a PR" — enforce via hook, not memory
+
+`CLAUDE.md` states the rule (global instructions: "Pull from the target branch
+before creating PRs") but nothing checks it — it only holds as long as the agent
+remembers to read it. A `PreToolUse` hook gating `gh pr create` (or a git
+pre-push check comparing local `HEAD` against `origin/<base>`) would catch a
+stale branch mechanically instead of relying on instruction-following. Not
+started; raised as a question, not a decision — worth weighing against the
+false-positive cost of blocking a legitimate PR command.
