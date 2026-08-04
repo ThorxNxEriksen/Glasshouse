@@ -176,3 +176,15 @@ pre-push check comparing local `HEAD` against `origin/<base>`) would catch a
 stale branch mechanically instead of relying on instruction-following. Not
 started; raised as a question, not a decision — worth weighing against the
 false-positive cost of blocking a legitimate PR command.
+
+## 14. Auto-enter a worktree on SessionStart / after `/clear` — enforce via hook, not memory
+
+Same shape as #13. Global instructions say "Use EnterWorktree for all work. Do
+not work on master/main," but that only holds if the agent remembers it after
+a fresh `SessionStart` or a `/clear`, both of which drop conversation context
+without dropping the working directory. A `SessionStart` hook (and whatever
+hook fires on `/clear`, if any) that checks the cwd isn't a worktree and runs
+`EnterWorktree` automatically would make this mechanical. Not started; also
+worth weighing false positives — e.g. sessions that are deliberately read-only
+or already scoped to a non-default branch shouldn't be forced into a new
+worktree.
