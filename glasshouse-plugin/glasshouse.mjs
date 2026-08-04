@@ -1340,6 +1340,12 @@ function assertLauncherHandlesMissingNode() {
   if (!fs.existsSync(launcher)) {
     throw new Error(`glasshouse.sh is missing next to glasshouse.mjs — the hook cannot start`);
   }
+  // A CRLF checkout makes sh fail on every line with "$'\r': command not found".
+  // .gitattributes pins eol=lf; this catches a checkout that escaped it anyway.
+  assert.ok(
+    !fs.readFileSync(launcher, "utf8").includes("\r"),
+    "glasshouse.sh must have LF line endings — CRLF makes sh reject every line",
+  );
   if (spawnSync("sh", ["-c", "exit 0"]).status !== 0) return; // no POSIX shell here
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-launcher-"));
