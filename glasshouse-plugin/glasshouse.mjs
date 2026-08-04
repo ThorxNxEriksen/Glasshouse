@@ -177,12 +177,11 @@ function readInstalledHooks(settingsPath) {
   }
 }
 
-// Always-on skills never show up as Skill tool calls: plugins like superpowers
-// and ponytail inject their skill text via a SessionStart hook, and plugin hooks
-// live in the plugin's own manifest, not in settings.json's "hooks" block — so
-// readInstalledHooks cannot see them either. The enabled-plugin set is the only
-// local signal that those skills were active. Names only (public marketplace
-// identifiers like "ponytail@ponytail"); no paths, no versions.
+// The enabled-plugin roster: which capability surfaces the user has installed.
+// This is a *configuration* fact, not usage — a plugin ships many skills, and
+// enabling it says nothing about which ones ran. For the one skill per plugin
+// that genuinely can't be counted, see readAlwaysOnSkills below. Names only
+// (public marketplace identifiers like "ponytail@ponytail"); no paths, no versions.
 function readEnabledPlugins(settingsPath) {
   try {
     const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
@@ -190,6 +189,153 @@ function readEnabledPlugins(settingsPath) {
     if (!plugins || typeof plugins !== "object") return [];
     // Disabled entries are present-but-false, so filter on the value, not the key.
     return Object.keys(plugins).filter((name) => plugins[name] === true).sort();
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Always-on skills
+//
+// A plugin's own SessionStart hook can print one skill's text as
+// additionalContext, putting it in context with no Skill tool call at all — and
+// plugin hooks live in the plugin, not in settings.json's "hooks" block, so
+// readInstalledHooks can't see them either. That one entry-point skill per plugin
+// is the only genuinely dark skill: everything else a plugin ships arrives as an
+// ordinary Skill call and is already captured in skill_name.
+//
+// Emits names only — "<plugin>@<marketplace>" and "<plugin>:<skill>", both public
+// marketplace identifiers. Never installPath, which is absolute and carries the
+// OS username.
+// ---------------------------------------------------------------------------
+
+// Cap per hook file so a plugin shipping a bundled megabyte can't stall the hook.
+const HOOK_FILE_MAX_BYTES = 256 * 1024;
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function listDirNames(dir) {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+// Two registration forms are both live and both must work: ponytail declares
+// "hooks": "./hooks/claude-codex-hooks.json" in its plugin.json, while superpowers
+// has no "hooks" key at all and relies on Claude Code auto-discovering the
+// conventional hooks/hooks.json. Checking only the manifest misses superpowers.
+function readPluginHooksManifest(root) {
+  const declared = readJsonFile(path.join(root, ".claude-plugin", "plugin.json"))?.hooks;
+  const candidates = typeof declared === "string" && declared ? [path.resolve(root, declared)] : [];
+  candidates.push(path.join(root, "hooks", "hooks.json"));
+  for (const candidate of candidates) {
+    const manifest = readJsonFile(candidate);
+    if (manifest) return manifest;
+  }
+  return null;
+}
+
+function injectsAtSessionStart(root) {
+  const entries = readPluginHooksManifest(root)?.hooks?.SessionStart;
+  return Array.isArray(entries) && entries.length > 0;
+}
+
+// Read the hooks directory non-recursively: the scripts that do the injecting sit
+// at its top level, and recursing would drag in node_modules on some plugins.
+function readHookTexts(dir) {
+  const texts = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return texts;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const file = path.join(dir, entry.name);
+    try {
+      if (fs.statSync(file).size > HOOK_FILE_MAX_BYTES) continue;
+      texts.push(fs.readFileSync(file, "utf8"));
+    } catch {
+      // Unreadable file — skip it, never fail the whole scan.
+    }
+  }
+  return texts;
+}
+
+// The injected skill's name is declared nowhere, so it has to be inferred — but
+// every plugin observed injects by *reading its own SKILL.md*, and that read is a
+// reliable fingerprint. Three plugins, three quoting styles, one shape:
+//
+//   superpowers  cat "${PLUGIN_ROOT}/skills/using-superpowers/SKILL.md"
+//   ponytail     path.join(__dirname, '..', 'skills', 'ponytail', 'SKILL.md')
+//   vercel       join(pluginRoot(), "skills", "knowledge-update", "SKILL.md")
+//
+// So match the "skills <name> SKILL.md" token sequence through arbitrary quote and
+// separator noise. Do NOT go back to counting how often each skill name is
+// mentioned: that looked plausible and was measurably wrong — vercel's hooks ship
+// a skill *ranker* naming dozens of skills, so the most-mentioned one ("ai-sdk")
+// is not the injected one, and a bare substring scan additionally matched "eve"
+// inside "every"/"never".
+const SKILL_MD_REF = /skills["'\s]*[,/]["'\s]*([A-Za-z0-9._-]+)["'\s]*[,/]["'\s]*SKILL\.md/g;
+
+function inferEntryPointSkill(root) {
+  const shipped = new Set(listDirNames(path.join(root, "skills")));
+  if (!shipped.size) return null;
+
+  const found = new Set();
+  for (const text of readHookTexts(path.join(root, "hooks"))) {
+    for (const [, name] of text.matchAll(SKILL_MD_REF)) {
+      // Only trust a capture naming a directory the plugin really ships, so a
+      // variable or template placeholder can't sail through as a skill name.
+      if (shipped.has(name)) found.add(name);
+    }
+  }
+  // Exactly one, or nothing safe to report — a confidently wrong name is worse
+  // than none, and the caller falls back to the plugin name.
+  return found.size === 1 ? [...found][0] : null;
+}
+
+// The skill namespace is the plugin's own manifest name, which is NOT always the
+// enabledPlugins key: vercel is keyed "vercel-plugin@vercel" but ships its skills
+// as "vercel:knowledge-update".
+function pluginSkillPrefix(root, key) {
+  const declared = readJsonFile(path.join(root, ".claude-plugin", "plugin.json"))?.name;
+  return typeof declared === "string" && declared ? declared : key.split("@")[0];
+}
+
+function readAlwaysOnSkills(settingsPath) {
+  try {
+    const claudeDir = path.dirname(settingsPath);
+    // installed_plugins.json keys on the same "<plugin>@<marketplace>" string as
+    // enabledPlugins and gives an exact installPath, which removes all version
+    // guessing — the cache can hold several versions of a plugin (superpowers has
+    // both 5.1.0 and 6.2.0) while only one is installed.
+    const installed = readJsonFile(path.join(claudeDir, "plugins", "installed_plugins.json"))?.plugins;
+    if (!installed || typeof installed !== "object") return [];
+
+    const result = [];
+    for (const key of readEnabledPlugins(settingsPath)) {
+      const root = installed[key]?.[0]?.installPath;
+      if (typeof root !== "string" || !root) continue;
+      // No SessionStart hook means nothing is injected, so the plugin is not
+      // always-on. This is what keeps the list a real subset of enabled_plugins.
+      if (!injectsAtSessionStart(root)) continue;
+      const skill = inferEntryPointSkill(root);
+      result.push({ plugin: key, skill: skill ? `${pluginSkillPrefix(root, key)}:${skill}` : null });
+    }
+    return result;
   } catch {
     return [];
   }
@@ -264,6 +410,7 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
   if (eventName === "SessionStart") {
     row.installed_hooks = readInstalledHooks(settingsPath);
     row.enabled_plugins = consent?.activity === "yes" ? readEnabledPlugins(settingsPath) : null;
+    row.always_on_skills = consent?.activity === "yes" ? readAlwaysOnSkills(settingsPath) : null;
   } else if (eventName === "InstructionsLoaded") {
     const rawContent = readInstructionsContent(payload);
     row.content = consent?.claudeMd === "redacted" ? redactClaudeMd(rawContent) : rawContent;
@@ -719,6 +866,115 @@ async function selfCheck() {
     fs.rmSync(pluginSettings, { force: true });
   }
   assert.deepStrictEqual(readEnabledPlugins(path.join(os.tmpdir(), "glasshouse-no-such.json")), []);
+
+  // always_on_skills: only enabled plugins that actually register a SessionStart
+  // hook, with the entry-point skill inferred from their hook scripts. The fixture
+  // covers all four shapes seen in the wild plus both skip paths.
+  const alwaysOnHome = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-alwayson-"));
+  try {
+    const write = (content, ...segs) => {
+      const file = path.join(alwaysOnHome, ...segs);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, content);
+    };
+    const skillDir = (...segs) => fs.mkdirSync(path.join(alwaysOnHome, ...segs), { recursive: true });
+
+    // alpha: hooks file declared via the manifest's "hooks" key (ponytail's shape),
+    // slash-separated path, and a manifest "name" that differs from the
+    // enabledPlugins key (vercel's shape — keyed vercel-plugin@vercel, ships
+    // vercel:*). The prefix must come from the manifest, not the key.
+    write(
+      JSON.stringify({ name: "alpha-named", hooks: "./hooks/mine.json" }),
+      "alpha", ".claude-plugin", "plugin.json",
+    );
+    write(JSON.stringify({ hooks: { SessionStart: [{}] } }), "alpha", "hooks", "mine.json");
+    write('cat "$ROOT/skills/entry/SKILL.md"', "alpha", "hooks", "boot.sh");
+    skillDir("alpha", "skills", "entry");
+    // A skill named far more often than the injected one must not win — this is
+    // what the discarded frequency heuristic got wrong on vercel.
+    write("noisy noisy noisy noisy noisy", "alpha", "hooks", "ranker.js");
+    skillDir("alpha", "skills", "noisy");
+
+    // beta: no manifest at all — hooks must be found via the conventional
+    // hooks/hooks.json (superpowers' shape), the name only appears split across
+    // path.join arguments, and the prefix falls back to the key.
+    write(JSON.stringify({ hooks: { SessionStart: [{}] } }), "beta", "hooks", "hooks.json");
+    write("path.join('..','skills','main','SKILL.md')", "beta", "hooks", "activate.js");
+    skillDir("beta", "skills", "main");
+    skillDir("beta", "skills", "aux");
+
+    // delta: injects at SessionStart but reads two different SKILL.md files, so no
+    // single name is safe — must report the plugin with a null skill, not a guess.
+    write(JSON.stringify({ hooks: { SessionStart: [{}] } }), "delta", "hooks", "hooks.json");
+    write("skills/one/SKILL.md and skills/two/SKILL.md", "delta", "hooks", "boot.sh");
+    skillDir("delta", "skills", "one");
+    skillDir("delta", "skills", "two");
+
+    // gamma: has hooks, but nothing on SessionStart — not always-on at all.
+    write(JSON.stringify({ hooks: { PreToolUse: [{}] } }), "gamma", "hooks", "hooks.json");
+    skillDir("gamma", "skills", "thing");
+
+    write(
+      JSON.stringify({
+        enabledPlugins: {
+          "alpha@mk": true,
+          "beta@mk": true,
+          "delta@mk": true,
+          "gamma@mk": true,
+          "nocache@mk": true,
+          "off@mk": false,
+        },
+      }),
+      "settings.json",
+    );
+    write(
+      JSON.stringify({
+        plugins: {
+          "alpha@mk": [{ installPath: path.join(alwaysOnHome, "alpha") }],
+          "beta@mk": [{ installPath: path.join(alwaysOnHome, "beta") }],
+          "delta@mk": [{ installPath: path.join(alwaysOnHome, "delta") }],
+          "gamma@mk": [{ installPath: path.join(alwaysOnHome, "gamma") }],
+        },
+      }),
+      "plugins",
+      "installed_plugins.json",
+    );
+
+    // gamma is dropped (no SessionStart), nocache is dropped (no installPath),
+    // off is never enabled — so this is a strict subset of enabled_plugins.
+    const alwaysOnSettings = path.join(alwaysOnHome, "settings.json");
+    assert.deepStrictEqual(readAlwaysOnSkills(alwaysOnSettings), [
+      { plugin: "alpha@mk", skill: "alpha-named:entry" },
+      { plugin: "beta@mk", skill: "beta:main" },
+      { plugin: "delta@mk", skill: null },
+    ]);
+    // A skill directory no hook ever reads must not be reported at all.
+    assert.strictEqual(JSON.stringify(readAlwaysOnSkills(alwaysOnSettings)).includes("noisy"), false);
+
+    // installPath is absolute and carries the OS username — it must never survive
+    // into the row, only the plugin/skill names derived from it.
+    assert.strictEqual(JSON.stringify(readAlwaysOnSkills(alwaysOnSettings)).includes(alwaysOnHome), false);
+
+    const alwaysOnArgs = {
+      eventName: "SessionStart",
+      payload: { cwd: "/tmp/x" },
+      config: {},
+      settingsPath: alwaysOnSettings,
+    };
+    assert.strictEqual(
+      buildRow({ ...alwaysOnArgs, consent: { claudeMd: "none", activity: "yes" } }).always_on_skills.length,
+      3,
+    );
+    assert.strictEqual(
+      buildRow({ ...alwaysOnArgs, consent: { claudeMd: "none", activity: "no" } }).always_on_skills,
+      null,
+    );
+  } finally {
+    fs.rmSync(alwaysOnHome, { recursive: true, force: true });
+  }
+  // A missing settings.json / installed_plugins.json must degrade to [], never throw:
+  // this runs on every session start on other people's machines.
+  assert.deepStrictEqual(readAlwaysOnSkills(path.join(os.tmpdir(), "glasshouse-no-such.json")), []);
 
   // permission_mode is gated on activity consent ("activity sharing" covers both
   // tool/skill/MCP usage AND permission-mode timing) — activity !== "yes" must

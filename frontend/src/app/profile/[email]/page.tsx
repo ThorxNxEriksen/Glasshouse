@@ -44,6 +44,9 @@ interface EventRow {
   content: string | null;
   installed_hooks: Record<string, string[]> | null;
   enabled_plugins: string[] | null;
+  // One entry per plugin that injects a skill at SessionStart — a strict subset of
+  // enabled_plugins. skill is null when the name couldn't be inferred safely.
+  always_on_skills: { plugin: string; skill: string | null }[] | null;
   raw: Record<string, unknown> | null;
   client_ts: string;
 }
@@ -286,7 +289,7 @@ export default function ProfilePage() {
     getSupabaseClient()
       .from("public_profile_events")
       .select(
-        "session_id,user_email,hook_event_name,tool_name,skill_name,permission_mode,repo_name,content,installed_hooks,enabled_plugins,raw,client_ts"
+        "session_id,user_email,hook_event_name,tool_name,skill_name,permission_mode,repo_name,content,installed_hooks,enabled_plugins,always_on_skills,raw,client_ts"
       )
       .eq("user_email", email)
       // PostgREST caps every response at 1000 rows regardless of what's
@@ -302,6 +305,7 @@ export default function ProfilePage() {
         if (cancelled) return;
         setRows(!error && data ? (data as EventRow[]) : []);
       });
+
     return () => {
       cancelled = true;
     };
@@ -325,13 +329,17 @@ export default function ProfilePage() {
   const maxSkillCount = Math.max(1, ...topEntries(allSkills, 8).map(([, c]) => c));
   const skillBars = topEntries(allSkills, 8).map(([name, count]) => ({ name, count, pct: (count / maxSkillCount) * 100 }));
 
-  // Always-on skills: no tool call exists to count, so this is presence only —
-  // the enabled-plugin set from the most recent session that reported one.
-  const alwaysOnPlugins =
+  // The two static measurements, both "as of the most recent session that reported
+  // one". Deliberately separate: enabled plugins are a capability surface (what is
+  // installed), always-on skills are the one skill per plugin that is in context
+  // every session and can never appear as a Skill call. Neither is a count.
+  const latestWith = <K extends keyof EventRow>(key: K) =>
     rows
-      .filter((r) => r.enabled_plugins?.length)
-      .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0]
-      ?.enabled_plugins ?? [];
+      .filter((r) => (r[key] as unknown[] | null)?.length)
+      .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0]?.[key];
+
+  const enabledPlugins = latestWith("enabled_plugins") ?? [];
+  const alwaysOnSkills = latestWith("always_on_skills") ?? [];
 
   const mcpCounts: Record<string, number> = {};
   for (const [tool, count] of Object.entries(allTools)) {
@@ -535,14 +543,18 @@ export default function ProfilePage() {
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 12, borderTop: "1px solid var(--border-subtle)" }}>
                   <span style={eyebrowStyle}>Always on</span>
                   <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                    Injected every session by plugin hooks — active, not counted
+                    Injected into context every session by a plugin&rsquo;s SessionStart hook — active, not counted
                   </p>
-                  {alwaysOnPlugins.length === 0 ? (
-                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No enabled plugins recorded yet.</span>
+                  {alwaysOnSkills.length === 0 ? (
+                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>
+                      No always-on skills recorded yet.
+                    </span>
                   ) : (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                      {alwaysOnPlugins.map((name) => (
-                        <Tag key={name}>{name.split("@")[0]}</Tag>
+                      {alwaysOnSkills.map(({ plugin, skill }) => (
+                        // Fall back to the plugin when the skill name couldn't be
+                        // inferred — better a coarser label than a wrong one.
+                        <Tag key={plugin}>{skill ?? plugin.split("@")[0]}</Tag>
                       ))}
                     </div>
                   )}
@@ -571,6 +583,26 @@ export default function ProfilePage() {
                   </>
                 ) : (
                   <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No hook registration recorded yet.</p>
+                )}
+              </div>
+            </Card>
+
+            {/* Configuration, not activity: which plugins are installed says nothing
+                about which of their skills ran — that lives in the skills card. */}
+            <Card>
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <Badge tone="accent">plugins</Badge>
+                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  {enabledPlugins.length} enabled — the skills available to reach for, not a usage count
+                </p>
+                {enabledPlugins.length === 0 ? (
+                  <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No enabled plugins recorded yet.</span>
+                ) : (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {enabledPlugins.map((name) => (
+                      <Tag key={name}>{name.split("@")[0]}</Tag>
+                    ))}
+                  </div>
                 )}
               </div>
             </Card>
