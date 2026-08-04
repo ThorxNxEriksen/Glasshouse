@@ -27,6 +27,13 @@ interface PluginAdoption {
   plugin_name: string;
   user_count: number;
 }
+// Always-on adoption is a strict subset of plugin adoption: only plugins whose
+// SessionStart hook injects a skill. skill_name is null when it couldn't be inferred.
+interface AlwaysOnAdoption {
+  plugin_name: string;
+  skill_name: string | null;
+  user_count: number;
+}
 
 function formatRelative(ms: number) {
   const diffMin = Math.round((Date.now() - ms) / 60000);
@@ -55,6 +62,7 @@ export default function DirectoryPage() {
   const [toolTotals, setToolTotals] = useState<ToolTotal[]>([]);
   const [skillTotals, setSkillTotals] = useState<SkillTotal[]>([]);
   const [pluginAdoption, setPluginAdoption] = useState<PluginAdoption[]>([]);
+  const [alwaysOnAdoption, setAlwaysOnAdoption] = useState<AlwaysOnAdoption[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,6 +96,13 @@ export default function DirectoryPage() {
       .select("plugin_name,user_count")
       .then(({ data, error }) => {
         if (!cancelled && !error && data) setPluginAdoption(data as PluginAdoption[]);
+      });
+
+    supabase
+      .from("public_always_on_adoption")
+      .select("plugin_name,skill_name,user_count")
+      .then(({ data, error }) => {
+        if (!cancelled && !error && data) setAlwaysOnAdoption(data as AlwaysOnAdoption[]);
       });
 
     return () => {
@@ -230,7 +245,7 @@ export default function DirectoryPage() {
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 <Badge tone="warning">plugins</Badge>
-                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>Always-on across the people above</p>
+                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>Enabled across the people above</p>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                   {pluginAdoption.length === 0 && (
                     <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No enabled plugins recorded yet.</span>
@@ -241,7 +256,30 @@ export default function DirectoryPage() {
                         {row.user_count} user{row.user_count === 1 ? "" : "s"} {row.user_count === 1 ? "has" : "have"}
                       </span>
                       <Tag>{row.plugin_name.split("@")[0]}</Tag>
-                      <span>always-on</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </Card>
+
+            {/* Distinct from the plugins card above: these skills are in context for
+                every single session, without anyone invoking them. */}
+            <Card>
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <Badge tone="accent">always on</Badge>
+                <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  Loaded into context every session, never invoked
+                </p>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {alwaysOnAdoption.length === 0 && (
+                    <span style={{ fontSize: "var(--text-xs)", color: "var(--text-faint)" }}>No always-on skills recorded yet.</span>
+                  )}
+                  {alwaysOnAdoption.map((row) => (
+                    <div key={row.plugin_name} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                      <span>
+                        {row.user_count} user{row.user_count === 1 ? "" : "s"} {row.user_count === 1 ? "has" : "have"}
+                      </span>
+                      <Tag>{row.skill_name ?? row.plugin_name.split("@")[0]}</Tag>
                     </div>
                   ))}
                 </div>

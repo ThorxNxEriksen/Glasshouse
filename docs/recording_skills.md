@@ -8,28 +8,60 @@ doc (`PLAN.md`, since removed — see git history).
 **Provenance.** Everything below marked *Verified* was checked on 2026-08-03
 against Claude Code `2.1.220`, Node `v24.15.0`, Windows 11, against real
 transcripts in `~/.claude/projects/` and a live round-trip into the Glasshouse
-Supabase project. Claims marked *Unverified* were not tested — treat them as
+Supabase project. §1, §5, §5.1, §5.2 and §8 were revised on 2026-08-04 against
+`superpowers@6.2.0` / `ponytail@4.8.4` / `vercel-plugin@1e821f3087d6` plugin manifests
+and a live round-trip of the `always_on_skills` column — that revision corrected a false
+claim in the original §5, which is quoted and marked in place rather than deleted. Claims marked *Unverified* were not tested — treat them as
 open questions, not facts. Re-run the recipes in [§6 Re-verifying](#6-re-verifying)
 after any Claude Code upgrade; none of this is a documented, stable API.
 
 ---
 
-## 1. The three ways a skill activates
+## 1. The four ways a skill's text enters context
 
-Only one of them is a tool call. This is the single most important thing on this
-page: "skill usage" is not one measurement, it is three different events with
-three different observability stories.
+Two of them are `Skill` tool calls. This is the single most important thing on
+this page: "skill usage" is not one measurement, it is four different events with
+four different observability stories.
 
 | Path | How it activates | Produces a `Skill` tool call? | Observable by a hook? |
 |---|---|---|---|
 | **Model-invoked** | Claude decides a skill applies and calls the `Skill` tool | Yes | Yes — `PreToolUse` |
 | **User slash command** | User types `/skill-name`, harness routes it to the `Skill` tool | Yes | Yes — `PreToolUse` |
-| **Plugin-injected (always-on)** | Plugin's own `SessionStart` hook prints the skill text as `additionalContext` | **No** | **No** — see §5 |
+| **Entry-point injection (always-on)** | Plugin's own `SessionStart` hook prints **one** skill's text as `additionalContext` | **No** | Not as an event, but the skill is *named* in `always_on_skills` — §5, §5.2 |
+| **Progressive disclosure** | An already-loaded skill tells Claude to `Read` one of its own sub-files | No | Yes — as a `Read` `PreToolUse` with `file_path`; see §5.1 |
 
 The first two are indistinguishable in the payload. The hook sees an identical
 `Skill` tool call whether Claude chose the skill or the user typed `/skill`. So
 the mock's "you vs. Claude" split on the profile page is **not implementable**
 from hook data — do not try to resurrect it without a new signal.
+
+### Do not confuse "the plugin is always on" with "its skills are invisible"
+
+The single most misleading thing you can believe about this pipeline (and an
+earlier revision of §5 said it outright) is that an always-on plugin's skills are
+uncountable. They are not. **A plugin injects exactly one entry-point skill; every
+other skill it ships is an ordinary `Skill` tool call and is fully captured.**
+
+Verified 2026-08-04 against `superpowers@6.2.0`, which ships 14 skills.
+`hooks/session-start` reads precisely one file:
+
+```bash
+using_superpowers_content=$(cat "${PLUGIN_ROOT}/skills/using-superpowers/SKILL.md")
+```
+
+So 1 skill is injected and 13 — `brainstorming`, `systematic-debugging`,
+`subagent-driven-development`, … — are countable. `ponytail@4.8.4` is structurally
+identical: `hooks/ponytail-activate.js` injects the `ponytail` skill at
+`SessionStart`, while `ponytail-help`, `ponytail-review`, `ponytail-audit`,
+`ponytail-debt` and `ponytail-gain` are ordinary tool calls. Both halves are
+present in live data — `superpowers:brainstorming` and `ponytail:ponytail-help`
+each have rows.
+
+**Why the confusion is easy.** Skill *discovery* and skill *loading* are separate.
+At session start the harness injects a one-line `name: description` entry for
+every available skill so Claude knows what exists; the `SKILL.md` body loads only
+on demand. That on-demand load *is* the `Skill` tool call. The moment you would
+most want to observe is the one moment that is loudest in the hook stream.
 
 > A `UserPromptSubmit` hook could in principle catch a literal `/skill-name`
 > prompt and recover the "user typed it" case. *Unverified* — not attempted, and
@@ -123,6 +155,7 @@ Relevant schema (see `schema.sql` for the full definition):
 | `tool_name` | `text` | `"Skill"` for every skill invocation |
 | `skill_name` | `text` | The skill's actual name; `null` on non-skill rows **and on rows written before 2026-08-03** |
 | `enabled_plugins` | `jsonb` | Array of enabled plugin ids, `SessionStart` rows only (§5) |
+| `always_on_skills` | `jsonb` | `[{plugin, skill}]` for plugins that inject at `SessionStart`; a strict subset of `enabled_plugins`, `SessionStart` rows only (§5.2) |
 
 Plus `claude_events_skill_name_idx` (partial, `where skill_name is not null`) and
 the `session_skill_usage` view — same shape as `session_tool_usage`, one grain
@@ -184,11 +217,20 @@ Consequences for analysis:
 
 ---
 
-## 5. Always-on skills: why they are invisible
+## 5. Entry-point skills: why they are invisible
 
-`superpowers` and `ponytail` are active in essentially every session on this
-machine, and **neither ever appears as a `Skill` tool call**. There is nothing to
-count. Three separate mechanisms conspire here.
+> **Corrected 2026-08-04.** This section used to open with "`superpowers` and
+> `ponytail` … **neither ever appears as a `Skill` tool call**. There is nothing to
+> count." That is **false**, and it contradicted §2 of this very document, which
+> lists `{"skill":"superpowers:brainstorming",…}` among its harvested transcript
+> samples. It swapped *the plugin* for *the plugin's entry-point skill*. The
+> invisible set is **2 skills** (`superpowers:using-superpowers`,
+> `ponytail:ponytail`), not 2 plugins. See §1 for the corrected model; the
+> mechanics below are accurate and unchanged.
+
+The one skill a plugin injects at `SessionStart` never appears as a `Skill` tool
+call, so for that skill there is nothing to count. Three separate mechanisms
+conspire here.
 
 **(a) They inject via `SessionStart`, not via a tool call.** A `SessionStart`
 hook exits 0 and prints:
@@ -237,7 +279,7 @@ Object.keys(plugins).filter((name) => plugins[name] === true).sort()
 
 ### Report presence, not counts
 
-An always-on skill loads unconditionally, every session. "You used ponytail 47
+An entry-point skill loads unconditionally, every session. "You used ponytail 47
 times" would be fiction — the number would just be a session count wearing a
 disguise. The profile page therefore splits the skills card in two:
 
@@ -245,11 +287,18 @@ disguise. The profile page therefore splits the skills card in two:
 - **Always on** — tags from `enabled_plugins`. Presence only, explicitly labelled
   "active, not counted".
 
+Since 2026-08-04 the "Always on" section names the entry-point **skill**, from the
+`always_on_skills` column (§5.2) — not the plugin. The plugin roster moved to its own
+card, because "which plugins are installed" is configuration and belongs next to hooks,
+not on the same axis as a measured invocation. See §8 for the three tiers.
+
 Known limits of `enabled_plugins`:
 
 - It is a **plugin** roster, not a skill roster. A plugin ships many skills;
   enabling it does not mean all of them loaded. It answers "which skill packs
-  were active", not "which skill text entered context".
+  were available", not "which skill text entered context". Do **not** read it as
+  "these skills are uncountable" — see §1. For the one skill per plugin that
+  genuinely is uncountable, use `always_on_skills` (§5.2) instead.
 - It is written on `SessionStart` only, so it lags a mid-session `/plugin`
   toggle by one session.
 - It cannot distinguish "plugin enabled and injected a skill" from "plugin
@@ -257,6 +306,132 @@ Known limits of `enabled_plugins`:
 - *Unverified:* project-level `.claude/settings.json` may also carry
   `enabledPlugins`. Glasshouse reads the user-level file only, so a
   project-scoped plugin would be missed.
+
+### The entry-point skill is double-loaded, and partly counted
+
+`using-superpowers` instructs Claude to invoke skills via the `Skill` tool, and
+Claude sometimes applies that to `using-superpowers` itself — even though the
+`SessionStart` hook already put the full text in context. Local transcripts carry
+28 such redundant `{"skill":"superpowers:using-superpowers"}` calls; the database
+has 2 (the rest predate skill-name capture).
+
+So the entry-point skill is not cleanly uncounted — it is *inconsistently* counted,
+which is worse. A bar for `superpowers:using-superpowers` measures how often Claude
+redundantly re-invoked an already-loaded skill, not how often the skill was active
+(the answer to that is: every session). Treat any entry-point skill's `skill_name`
+count as noise, not signal.
+
+---
+
+## 5.1 Progressive disclosure: capturable today, deliberately not built
+
+A loaded skill often defers most of its content to sibling files and tells Claude
+to `Read` them on demand — `systematic-debugging/root-cause-tracing.md`,
+`subagent-driven-development/task-reviewer-prompt.md`,
+`brainstorming/visual-companion.md`. `superpowers@6.2.0` ships 14 `SKILL.md` files
+and 36 such sub-files.
+
+These are **not** `Skill` calls, so `skill_name` is null for them. But they are
+`Read` calls, and `buildRow` already stores `row.file_path` for every `PreToolUse`
+(`glasshouse.mjs:274`). **The data is already in the base table.** Verified
+2026-08-04 — real rows, unprompted:
+
+```
+Read  …\superpowers\6.2.0\skills\requesting-code-review\code-reviewer.md
+Read  …\superpowers\6.2.0\skills\subagent-driven-development\task-reviewer-prompt.md
+Read  …\superpowers\6.2.0\skills\subagent-driven-development\scripts\task-brief
+Read  …\impeccable\4.0.4\skills\impeccable\reference\craft-floor.md
+```
+
+The plugin cache path is fully structured and parseable:
+
+```
+~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/<sub-path>
+```
+
+Nothing needs to be *captured* to report on this — only *derived*. Two caveats
+before anyone builds it:
+
+**(a) `file_path` is deliberately unpublished, and must stay that way.**
+`row.file_path` on `PreToolUse` is **not** consent-gated (unlike `permission_mode`,
+`repo_name`, `enabled_plugins`) and carries absolute paths into the user's own
+projects, OS username included. `public_profile_events` keeps it out by
+whitelist, and reduces `raw` to `{memory_type}` for exactly this reason — see the
+comment above that view in `schema.sql`. A skill-depth feature must publish a
+*derived* `plugin/skill/sub-file` triple, never the path it came from, and it must
+match on the plugin-cache prefix only so no project path can ever fall through.
+
+**(b) Consent.** Skill sub-file names are public marketplace identifiers, so the
+derived triple belongs under the existing **activity** gate. The raw `file_path`
+it is derived from is not covered by any gate today, which is a separate open
+issue (§8) and a reason to derive at capture time in the hook rather than in a view.
+
+**Declined 2026-08-04, on purpose.** Depth of use is a genuinely different measurement —
+reading 6 of `systematic-debugging`'s 10 sub-files is a stronger signal than one `Skill`
+call — but it describes *a skill's internal design* more than it describes what a person
+uses, and the dashboard exists so co-workers can be inspired by each other's tooling.
+Sub-file counts don't serve that. This section stays as a record of a road not taken and
+of where the data already sits, not as a backlog item. If it is ever revisited, the two
+caveats above (published as a derived triple only; `file_path` ungated at capture) are the
+binding constraints.
+
+---
+
+## 5.2 `always_on_skills`: naming the entry-point skill (verified 2026-08-04)
+
+`readAlwaysOnSkills` in `glasshouse.mjs` records the entry-point skill per plugin on
+`SessionStart`, gated on activity consent like `enabled_plugins`:
+
+```json
+[{"plugin":"ponytail@ponytail","skill":"ponytail:ponytail"},
+ {"plugin":"superpowers@claude-plugins-official","skill":"superpowers:using-superpowers"},
+ {"plugin":"vercel-plugin@vercel","skill":"vercel:knowledge-update"}]
+```
+
+It is a **strict subset** of `enabled_plugins` — 3 of 6 on the reference machine — because
+a plugin only qualifies if it registers a `SessionStart` hook. That is what makes it a
+different measurement rather than the same roster twice. Four details, each of which broke
+a simpler implementation:
+
+**(a) Resolve the install path from `installed_plugins.json`, don't guess it.** It keys on
+the same `plugin@marketplace` string as `enabledPlugins` and gives an exact `installPath`.
+The cache holds multiple versions (superpowers has both `5.1.0` and `6.2.0`) and only one
+is installed. Store names only — `installPath` is absolute and contains the OS username;
+a `--self-check` assertion enforces that it never reaches the row.
+
+**(b) Hook registration has two forms and both are load-bearing.** ponytail declares
+`"hooks": "./hooks/claude-codex-hooks.json"` in `.claude-plugin/plugin.json`; superpowers
+has **no `"hooks"` key at all** and is auto-discovered from the conventional
+`hooks/hooks.json`. Checking only the manifest silently misses superpowers — the exact
+plugin this feature exists for.
+
+**(c) The skill name is declared nowhere, so match the `SKILL.md` read.** Every plugin
+observed injects by reading its own `SKILL.md`, in three different quoting styles:
+
+```
+superpowers  cat "${PLUGIN_ROOT}/skills/using-superpowers/SKILL.md"
+ponytail     path.join(__dirname, '..', 'skills', 'ponytail', 'SKILL.md')
+vercel       join(pluginRoot(), "skills", "knowledge-update", "SKILL.md")
+```
+
+One regex over the `skills` → *name* → `SKILL.md` token sequence handles all three. The
+capture is then intersected with the plugin's real `skills/*/` directories, so a variable
+or placeholder can't pass as a skill name. Exactly one survivor → use it; zero or several
+→ `null`, and the UI falls back to the plugin name.
+
+**(d) Two plausible heuristics were tried and are wrong. Do not reintroduce them.**
+
+| Rejected rule | Why it fails |
+|---|---|
+| Count how often each skill name appears in the plugin's `hooks/` dir, most mentions wins | vercel's hooks ship a skill **ranker** naming dozens of skills, so `ai-sdk` (6 files) beat `knowledge-update` (1). Frequency measures how chatty a hook is, not what it injects. |
+| Bare substring match of the skill name | `eve` matched inside *every*, *never*, *level*, so `vercel:eve` won outright. Word boundaries fix this one case but not the ranker above. |
+
+**(e) The skill prefix is the manifest `name`, not the `enabledPlugins` key.** vercel is
+keyed `vercel-plugin@vercel` but ships its skills as `vercel:*`. Read `name` from
+`.claude-plugin/plugin.json` and fall back to `key.split("@")[0]` only if it's absent.
+
+Everything degrades to `[]` or `{plugin, skill: null}` — never a throw. This runs at every
+session start on other people's machines.
 
 ---
 
@@ -285,6 +460,44 @@ order by client_ts desc limit 10;
 ```bash
 cat ~/.claude/plugins/cache/<plugin>/<plugin>/<version>/.claude-plugin/plugin.json
 # follow its "hooks" path to see the registered events
+```
+
+**Which skill a plugin injects vs. ships (the check that catches the §5 error).**
+Compare the count of shipped skills against the injected one — the difference is
+what remains countable:
+
+```bash
+P=~/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0
+ls "$P/skills"                       # every skill shipped (14)
+grep -o 'skills/[a-z-]*/SKILL.md' "$P/hooks/session-start"   # the injected one (1)
+```
+
+If the second command returns more than one path, the entry-point model in §1 has
+changed and the "Always on" card needs revisiting.
+
+**What `always_on_skills` resolves to on this machine**, without waiting for a session.
+Cut the CLI dispatch off the hook and call the function directly:
+
+```bash
+N=$(grep -n '^const mode = process.argv' glasshouse-plugin/glasshouse.mjs | cut -d: -f1)
+head -$((N-1)) glasshouse-plugin/glasshouse.mjs > /tmp/probe.mjs
+cat >> /tmp/probe.mjs <<'EOF'
+console.log(JSON.stringify(readAlwaysOnSkills(path.join(os.homedir(), ".claude", "settings.json")), null, 2));
+EOF
+node /tmp/probe.mjs
+```
+
+Expect a strict subset of `enabledPlugins` with a non-null `skill` per entry. A `null`
+skill means the §5.2(c) regex no longer matches that plugin's injection; a *missing*
+plugin means its `SessionStart` registration moved (§5.2(b)). Neither is a crash, and
+neither is visible without this check — which is why it exists.
+
+**Progressive-disclosure reads landing in the base table (§5.1):**
+
+```sql
+select tool_name, file_path, count(*) from claude_events
+where file_path ilike '%plugins%cache%skills%' group by 1,2 order by 3 desc;
+-- expect Read rows for skill sub-files; must NOT be visible via public_profile_events
 ```
 
 **Confirm subagent capture:** list Skill calls with timestamps from a session's
@@ -334,7 +547,40 @@ data", never crash a hook on someone's machine.
 
 ---
 
-## 8. Open questions
+## 8. Three tiers, not two: how this is categorised
+
+The dashboard used to model two tiers (invoked skills vs. always-on *plugins*), which
+forced plugins and skills onto one axis and caused the mislabelling described in §5.
+There are **three**, they answer different questions, and each now has its own column:
+
+| Tier | Unit | Source | What it means | Countable? |
+|---|---|---|---|---|
+| **Plugin** | `superpowers@claude-plugins-official` | `enabled_plugins` (SessionStart) | A capability *surface* was available. Says nothing about use. | No — presence only |
+| **Always-on skill** | `superpowers:using-superpowers` | `always_on_skills` (SessionStart, §5.2) | This skill is in context every session, injected, never invoked. | No — presence only |
+| **Invoked skill** | `superpowers:brainstorming` | `skill_name` (PreToolUse) | This skill's body entered context on purpose. | **Yes, per name** |
+
+A fourth tier exists in the raw data — skill sub-file reads, derivable from `file_path`
+(§5.1) — and was deliberately declined.
+
+So: **`superpowers` and `ponytail` are plugins, not skills.** They are containers that
+ship skills, hooks, commands and agents. Enabling one is a configuration fact, on the same
+footing as an installed hook or an MCP server; it is not an activity event.
+
+The muddle came from each plugin also *being* roughly one always-on skill in practice,
+because its entry-point skill is injected every session. But that skill has a name, and
+naming it is what keeps the tiers straight — "always on: `superpowers:using-superpowers`",
+never "always on: `superpowers`". As built:
+
+- **Configuration** — enabled plugins, on their own card beside hooks.
+- **Activity, uncounted** — always-on skills, tagged inside the skills card.
+- **Activity, counted** — invoked skills, as bars. MCP servers sit alongside, unchanged.
+
+Both static tiers are "as of the most recent session that reported one", so both lag a
+mid-session `/plugin` toggle by one session.
+
+---
+
+## 9. Open questions
 
 - Does `PostToolUse` for a `Skill` call carry a result worth capturing (e.g.
   whether the skill actually loaded vs. errored)? *Unverified* — Glasshouse
@@ -347,3 +593,11 @@ data", never crash a hook on someone's machine.
 - `SubagentStart` exists as a hook event (seen in ponytail's manifest) and is
   currently uncaptured. Might be a cleaner subagent-count signal than counting
   `Agent` tool calls.
+- **`file_path` on `PreToolUse` is captured with no consent gate at all** (§5.1).
+  It is kept out of public views by whitelist, so it does not leak today, but every
+  other identifying field is gated at *capture* time and this one is not. Should it
+  be gated on activity consent, or reduced at capture to a plugin-skill triple plus
+  null?
+- Are user- and project-level skills (`~/.claude/skills/`, `.claude/skills/`) also
+  progressively disclosed, and do their sub-file paths need the same derivation as
+  the plugin-cache prefix? *Unverified* — only plugin-cache reads were observed.

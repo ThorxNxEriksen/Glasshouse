@@ -14,6 +14,13 @@ The exposure control belongs one layer down: **each user decides how much of the
 
 `frontend/vercel.json` pins `"framework": "nextjs"`. The Project Settings preset was "Other", which ran `next build` and then served only `frontend/public/` as static files — every app route returned a platform 404 while `/next.svg` returned 200. Keep the preset in `vercel.json`, not in dashboard state a checkout can't see.
 
+## Reading data in the dashboard
+
+Two failure modes here are silent — they produce plausible wrong numbers instead of an error:
+
+- **PostgREST caps every response at 1000 rows**, whatever `.limit()` asks for. Never read a bare `.limit()` as "all rows". `ascending: true` therefore returned the *oldest* 1000 events and hid everything recent; the profile query now takes the newest window (`descending` + `limit(1000)`). That is a bound, not a fix: aggregates computed from the window read as lifetime figures while covering only the newest 1000 events — 23 of 41 sessions for one real account, and the window shrinks as usage grows. **Don't widen the fetch to compensate — aggregate server-side.** The page renders nothing finer than a session, so per-event rows should not reach the browser at all. See `backlog.md`.
+- **`useParams()` returns the raw, still-percent-encoded segment.** Every email's `@` arrives as `%40`, and passing that to a query re-encodes it to `%2540`, matching nobody — which rendered *every* profile blank. Decode before querying.
+
 ## Capturing skill usage
 
 **Read [`docs/recording_skills.md`](docs/recording_skills.md) before touching anything that reads or reports skill data.** It documents the observed payload shapes, what is verified vs. assumed, and how to re-verify after a Claude Code upgrade.
@@ -22,6 +29,7 @@ The two things that bite hardest:
 
 - `tool_name` is the literal `"Skill"` for every skill invocation — never the skill's own name, which lives in `tool_input.skill` (→ the `skill_name` column). Believing otherwise is what made the pipeline discard every skill name for weeks.
 - `tool_input.args` sits right beside the name and is **never** captured — it is free-text user content. A `--self-check` assertion enforces this; don't "fix" it.
+- A plugin is not a skill. Each plugin injects exactly **one** entry-point skill at `SessionStart` (uncountable, recorded by name in `always_on_skills`); every other skill it ships is a normal `Skill` call already counted in `skill_name`. Believing "superpowers is always-on, so its skills are invisible" is wrong and cost a rewrite — the three tiers are in §8.
 
 ## The hook
 

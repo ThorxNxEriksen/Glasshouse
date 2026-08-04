@@ -8,6 +8,15 @@
    through to the documented fallback stack below.
    ============================================================ */
 
+/* Typography tokens only, at document scope: globals.css points `body` at
+   --font-body so the whole app gets the brand stack instead of the
+   create-next-app Arial default. Everything else stays inside .profile-ds. */
+:root {
+  --font-display: "ESPeak", "Helvetica Neue", system-ui, sans-serif;
+  --font-body: "ESPeak", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", ui-monospace, "Menlo", monospace;
+}
+
 .profile-ds {
   /* ---- Brand: Petrol ---- */
   --petrol-900: #0e2b2b;
@@ -67,10 +76,10 @@
   --border-strong: var(--grey-300);
   --focus-ring: var(--teal-400);
 
-  /* ---- Type ---- */
-  --font-display: "ESPeak", "Helvetica Neue", system-ui, sans-serif;
-  --font-body: "ESPeak", "Helvetica Neue", system-ui, sans-serif;
-  --font-mono: "SFMono-Regular", ui-monospace, "Menlo", monospace;
+  /* ---- Type ----
+     The three font stacks live at :root (top of this file) so the document body
+     can inherit them too — colour and spacing tokens stay scoped to .profile-ds
+     on purpose, but typography should not stop at the wrapper. */
   --weight-thin: 100;
   --weight-regular: 400;
   --weight-bold: 700;

@@ -21,10 +21,22 @@ CREATE TABLE IF NOT EXISTS claude_events (
   content text,
   load_reason text,
   installed_hooks jsonb,
-  -- Always-on skills (superpowers, ponytail) are injected by *plugin*
-  -- SessionStart hooks: they never appear in settings.json's "hooks" block and
-  -- produce no Skill tool call, so enabledPlugins is the only signal they ran.
+  -- The enabled-plugin roster: which capability surfaces are installed. A
+  -- *configuration* fact, not usage — a plugin ships many skills and enabling it
+  -- says nothing about which ran. Do not read this as "these skills are
+  -- uncountable": every skill a plugin ships except its entry point arrives as an
+  -- ordinary Skill call and is already counted in skill_name.
   enabled_plugins jsonb,
+  -- The one skill per plugin that genuinely cannot be counted: a plugin's own
+  -- SessionStart hook prints its entry-point skill as additionalContext, so there
+  -- is no Skill tool call, and plugin hooks live in the plugin rather than in
+  -- settings.json's "hooks" block so installed_hooks can't see them either.
+  -- Shape: [{"plugin":"ponytail@ponytail","skill":"ponytail:ponytail"}, …], a
+  -- strict subset of enabled_plugins (3 of 6 on the reference machine). skill is
+  -- null when the name can't be inferred safely; the UI falls back to plugin.
+  -- Presence only — an entry-point skill loads every session, so counting it
+  -- would just be a session count in disguise.
+  always_on_skills jsonb,
   -- Gated on consent.activity === "yes", same as permission_mode/enabled_plugins:
   -- null on historical rows (no backfill) and on any row where the repo's
   -- consent isn't activity: "yes". A repo name can itself be sensitive (an
@@ -186,7 +198,7 @@ GRANT SELECT ON public_user_directory TO anon, authenticated;
 CREATE OR REPLACE VIEW public_profile_events AS
 SELECT session_id, user_email, NULL::text AS hostname, repo_name, hook_event_name,
        tool_name, skill_name, permission_mode, content, installed_hooks,
-       enabled_plugins,
+       enabled_plugins, always_on_skills,
        jsonb_build_object('memory_type', raw -> 'memory_type') AS raw,
        client_ts
 FROM claude_events;
@@ -220,3 +232,22 @@ FROM latest_session_start, LATERAL jsonb_array_elements_text(enabled_plugins) AS
 GROUP BY plugin.name ORDER BY user_count DESC;
 REVOKE ALL ON public_plugin_adoption FROM anon, authenticated;
 GRANT SELECT ON public_plugin_adoption TO anon, authenticated;
+
+-- Always-on adoption: which entry-point skills sit in people's context every
+-- session. Same "latest SessionStart per user" shape as public_plugin_adoption,
+-- but a strict subset of it — only plugins that actually inject. skill_name is
+-- null when it could not be inferred, so consumers render skill_name ?? plugin_name.
+CREATE OR REPLACE VIEW public_always_on_adoption AS
+WITH latest_session_start AS (
+  SELECT DISTINCT ON (user_email) user_email, always_on_skills
+  FROM claude_events
+  WHERE hook_event_name = 'SessionStart' AND always_on_skills IS NOT NULL AND user_email IS NOT NULL
+  ORDER BY user_email, client_ts DESC
+)
+SELECT entry ->> 'plugin' AS plugin_name,
+       entry ->> 'skill' AS skill_name,
+       COUNT(DISTINCT user_email) AS user_count
+FROM latest_session_start, LATERAL jsonb_array_elements(always_on_skills) AS entry
+GROUP BY 1, 2 ORDER BY user_count DESC;
+REVOKE ALL ON public_always_on_adoption FROM anon, authenticated;
+GRANT SELECT ON public_always_on_adoption TO anon, authenticated;
