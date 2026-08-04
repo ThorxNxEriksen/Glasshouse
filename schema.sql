@@ -367,3 +367,44 @@ FROM public_session_summary s
 GROUP BY s.user_email;
 REVOKE ALL ON public_user_totals FROM anon, authenticated;
 GRANT SELECT ON public_user_totals TO anon, authenticated;
+
+-- Per-user configuration snapshot. The three fields come from three
+-- independently-chosen rows: installed_hooks from the newest SessionStart
+-- that has one, enabled_plugins/always_on_skills each from the newest row
+-- with a NON-EMPTY array -- which may be a different row from the other two.
+-- A single DISTINCT ON over all three columns would silently force them to
+-- come from one row, so this stays three correlated subqueries.
+CREATE OR REPLACE VIEW public_user_snapshot AS
+WITH emails AS (
+  SELECT DISTINCT user_email FROM claude_events WHERE user_email IS NOT NULL
+)
+SELECT e.user_email,
+       (SELECT installed_hooks FROM claude_events c
+        WHERE c.user_email = e.user_email AND c.hook_event_name = 'SessionStart'
+          AND c.installed_hooks IS NOT NULL
+        ORDER BY c.client_ts DESC LIMIT 1) AS installed_hooks,
+       (SELECT enabled_plugins FROM claude_events c
+        WHERE c.user_email = e.user_email
+          AND jsonb_array_length(coalesce(c.enabled_plugins, '[]'::jsonb)) > 0
+        ORDER BY c.client_ts DESC LIMIT 1) AS enabled_plugins,
+       (SELECT always_on_skills FROM claude_events c
+        WHERE c.user_email = e.user_email
+          AND jsonb_array_length(coalesce(c.always_on_skills, '[]'::jsonb)) > 0
+        ORDER BY c.client_ts DESC LIMIT 1) AS always_on_skills
+FROM emails e;
+REVOKE ALL ON public_user_snapshot FROM anon, authenticated;
+GRANT SELECT ON public_user_snapshot TO anon, authenticated;
+
+-- Newest CLAUDE.md per (user, memory_type, repo). memory_type comes out of raw
+-- as a plain column so raw itself never reaches a public view.
+CREATE OR REPLACE VIEW public_claude_md_latest AS
+SELECT DISTINCT ON (user_email, coalesce(raw->>'memory_type', 'Project'), coalesce(repo_name, '(unknown repo)'))
+       user_email,
+       coalesce(raw->>'memory_type', 'Project') AS memory_type,
+       repo_name, content, client_ts
+FROM claude_events
+WHERE hook_event_name = 'InstructionsLoaded' AND content IS NOT NULL AND user_email IS NOT NULL
+ORDER BY user_email, coalesce(raw->>'memory_type', 'Project'),
+         coalesce(repo_name, '(unknown repo)'), client_ts DESC;
+REVOKE ALL ON public_claude_md_latest FROM anon, authenticated;
+GRANT SELECT ON public_claude_md_latest TO anon, authenticated;
