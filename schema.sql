@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS claude_events (
   -- SessionStart hooks: they never appear in settings.json's "hooks" block and
   -- produce no Skill tool call, so enabledPlugins is the only signal they ran.
   enabled_plugins jsonb,
+  -- Gated on consent.activity === "yes", same as permission_mode/enabled_plugins:
+  -- null on historical rows (no backfill) and on any row where the repo's
+  -- consent isn't activity: "yes". A repo name can itself be sensitive (an
+  -- internal or client project name), so it gets the same opt-in treatment as
+  -- the rest of activity sharing rather than the ungated cwd/git_branch pattern.
+  repo_name text,
   raw jsonb,
   claude_md_share_level text check (claude_md_share_level in ('redacted', 'full')),
   client_ts timestamptz not null default now(),
@@ -146,3 +152,71 @@ GROUP BY session_id, skill_name;
 
 REVOKE ALL ON session_skill_usage FROM anon;
 GRANT SELECT ON session_skill_usage TO authenticated;
+
+-- Public views (anon-readable). Deliberately NOT security_invoker — claude_events
+-- blocks anon at the base-table grant (INSERT only), so a security_invoker view
+-- would return zero rows to anon regardless of its own logic. These run with
+-- the view owner's privilege instead, and their column lists ARE the security
+-- boundary (no RLS backstop) — checked against consent gating and known
+-- identifying fields (hostname, cwd, and raw's embedded copy of cwd/file_path).
+
+CREATE OR REPLACE VIEW public_user_directory AS
+SELECT user_email, MAX(client_ts) AS last_active, COUNT(DISTINCT session_id) AS run_count
+FROM claude_events WHERE user_email IS NOT NULL GROUP BY user_email;
+REVOKE ALL ON public_user_directory FROM anon, authenticated;
+GRANT SELECT ON public_user_directory TO anon, authenticated;
+
+-- hostname nulled (machine name, never consented). cwd dropped entirely, not
+-- just unrendered — it's a full local path, typically with the OS username in
+-- it, and a fetch response is a leak even if the UI never prints it. raw is
+-- NOT passed through as-is: sanitizeRaw() spreads the whole payload into raw,
+-- so every row today also carries a second copy of cwd (verified: 1197/1197
+-- rows have raw ? 'cwd').
+--
+-- This is a WHITELIST, not the denylist it used to be. The prior version
+-- subtracted known-bad top-level keys (raw - 'cwd' - 'file_path' - 'path' -
+-- 'transcript_path' - 'prompt_id'), which only strips top-level jsonb keys.
+-- A live audit found a PreToolUse payload nests a path at
+-- tool_input.file_path (kept deliberately by sanitizeRaw's whitelist) plus
+-- top-level trigger_file_path/parent_file_path that the denylist never
+-- anticipated — a real leak across all 1,746 rows. A denylist rots every
+-- time a new field is added upstream; a whitelist can't, because the
+-- frontend only ever reads raw?.memory_type, so that's the only key let
+-- through here.
+CREATE OR REPLACE VIEW public_profile_events AS
+SELECT session_id, user_email, NULL::text AS hostname, repo_name, hook_event_name,
+       tool_name, skill_name, permission_mode, content, installed_hooks,
+       enabled_plugins,
+       jsonb_build_object('memory_type', raw -> 'memory_type') AS raw,
+       client_ts
+FROM claude_events;
+REVOKE ALL ON public_profile_events FROM anon, authenticated;
+GRANT SELECT ON public_profile_events TO anon, authenticated;
+
+CREATE OR REPLACE VIEW public_tool_totals AS
+SELECT tool_name, COUNT(*) AS call_count FROM claude_events
+WHERE hook_event_name = 'PreToolUse' AND tool_name IS NOT NULL GROUP BY tool_name;
+REVOKE ALL ON public_tool_totals FROM anon, authenticated;
+GRANT SELECT ON public_tool_totals TO anon, authenticated;
+
+CREATE OR REPLACE VIEW public_skill_totals AS
+SELECT skill_name, COUNT(*) AS call_count FROM claude_events
+WHERE hook_event_name = 'PreToolUse' AND tool_name = 'Skill' AND skill_name IS NOT NULL
+GROUP BY skill_name;
+REVOKE ALL ON public_skill_totals FROM anon, authenticated;
+GRANT SELECT ON public_skill_totals TO anon, authenticated;
+
+-- "Currently enabled" = as of each user's most recent SessionStart with a
+-- non-null enabled_plugins (DISTINCT ON per user_email, latest client_ts).
+CREATE OR REPLACE VIEW public_plugin_adoption AS
+WITH latest_session_start AS (
+  SELECT DISTINCT ON (user_email) user_email, enabled_plugins
+  FROM claude_events
+  WHERE hook_event_name = 'SessionStart' AND enabled_plugins IS NOT NULL AND user_email IS NOT NULL
+  ORDER BY user_email, client_ts DESC
+)
+SELECT plugin.name AS plugin_name, COUNT(DISTINCT user_email) AS user_count
+FROM latest_session_start, LATERAL jsonb_array_elements_text(enabled_plugins) AS plugin(name)
+GROUP BY plugin.name ORDER BY user_count DESC;
+REVOKE ALL ON public_plugin_adoption FROM anon, authenticated;
+GRANT SELECT ON public_plugin_adoption TO anon, authenticated;

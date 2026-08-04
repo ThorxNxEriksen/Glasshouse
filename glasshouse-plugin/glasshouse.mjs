@@ -117,6 +117,15 @@ function gitBranch(cwd) {
   }
 }
 
+// Short display name for a repo — never a full path or URL. Reuses
+// computeRepoKey's git-remote-or-resolved-path logic and takes the last path
+// segment either way.
+function repoName(cwd) {
+  const key = computeRepoKey(cwd);
+  const segments = key.split(/[\\/]/).filter(Boolean);
+  return segments.length ? segments[segments.length - 1] : path.basename(cwd);
+}
+
 // ---------------------------------------------------------------------------
 // CLAUDE.md redaction
 // ---------------------------------------------------------------------------
@@ -246,6 +255,7 @@ function buildRow({ eventName, payload, consent, config, settingsPath }) {
     permission_mode: consent?.activity === "yes" ? (payload?.permission_mode ?? null) : null,
     cwd,
     git_branch: gitBranch(cwd),
+    repo_name: consent?.activity === "yes" ? repoName(cwd) : null,
     claude_md_share_level: claudeMdShareLevel(consent?.claudeMd),
     raw: sanitizeRaw(payload, eventName, consent),
     client_ts: new Date().toISOString(),
@@ -430,14 +440,15 @@ async function runHookMode() {
           `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
             `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
             `data, then run: node "${hookPath}" set-email --email "<email>". ` +
-            `Nothing is sent anywhere until that command runs.`,
+            `Nothing is sent anywhere until that command runs. ` +
+            `This email will be shown on Glasshouse's public directory page and used in your profile's URL.`,
         );
       } else if (!consent) {
         notices.push(
           `Glasshouse usage analytics has no sharing preference on file for this repo yet. ` +
             `Ask the user via AskUserQuestion, exactly two questions: ` +
             `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
-            `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing) — yes / no. ` +
+            `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing + repo name) — yes / no. ` +
             `Then run: node "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
             `Nothing is sent for this repo until that command runs.`,
         );
@@ -556,6 +567,37 @@ async function selfCheck() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-selfcheck-"));
   try {
     assert.strictEqual(computeRepoKey(tmpDir), path.resolve(tmpDir));
+
+    // repoName itself (pure function, no consent involved) — path fallback.
+    assert.strictEqual(repoName(tmpDir), path.basename(tmpDir));
+    // + a second case in a throwaway git repo with a fake origin remote,
+    // asserting repoName strips ".git" and takes the last URL segment
+    // (e.g. git@github.com:someorg/glasshouse.git -> "glasshouse")
+    const fakeRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-fakerepo-"));
+    try {
+      execFileSync("git", ["init"], { cwd: fakeRepoDir, stdio: "ignore" });
+      execFileSync("git", ["remote", "add", "origin", "git@github.com:someorg/glasshouse.git"], {
+        cwd: fakeRepoDir,
+        stdio: "ignore",
+      });
+      assert.strictEqual(repoName(fakeRepoDir), "glasshouse");
+    } finally {
+      fs.rmSync(fakeRepoDir, { recursive: true, force: true });
+    }
+
+    // row.repo_name is gated on activity consent, same as permission_mode/enabled_plugins.
+    const activityYesRow = buildRow({
+      eventName: "SessionStart", payload: { cwd: tmpDir },
+      consent: { claudeMd: "none", activity: "yes" }, config: {},
+      settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+    });
+    assert.strictEqual(activityYesRow.repo_name, path.basename(tmpDir));
+    const activityNoRow = buildRow({
+      eventName: "SessionStart", payload: { cwd: tmpDir },
+      consent: { claudeMd: "none", activity: "no" }, config: {},
+      settingsPath: path.join(os.tmpdir(), "does-not-exist.json"),
+    });
+    assert.strictEqual(activityNoRow.repo_name, null);
 
     // loadConsentStore/loadConfig: missing file never throws.
     assert.deepStrictEqual(loadConsentStore(tmpDir), {});
