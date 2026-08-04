@@ -9,7 +9,8 @@
 //
 // Ships as the Claude Code plugin's hook script (${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs)
 // and is also usable standalone via install.mjs for local development.
-// See PLAN.md at the repo root for the full design this implements.
+// See docs/hook.md before editing this file — it covers the two-copies problem
+// and the exit invariant, both of which have already cost a debugging session.
 
 import fs from "node:fs";
 import path from "node:path";
