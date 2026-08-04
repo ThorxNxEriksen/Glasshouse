@@ -2,7 +2,8 @@
 
 How Claude Code actually exposes skill invocations to hooks, and what Glasshouse
 does with that. Written because the first implementation silently discarded every
-skill name for weeks, on the strength of one wrong sentence in `PLAN.md`.
+skill name for weeks, on the strength of one wrong sentence in the original design
+doc (`PLAN.md`, since removed — see git history).
 
 **Provenance.** Everything below marked *Verified* was checked on 2026-08-03
 against Claude Code `2.1.220`, Node `v24.15.0`, Windows 11, against real
