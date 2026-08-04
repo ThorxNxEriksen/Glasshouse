@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
 const HOOK_EVENTS = ["SessionStart", "InstructionsLoaded", "PreToolUse", "SessionEnd"];
+// Both are needed at runtime: glasshouse.sh is what settings.json points at, and it
+// launches glasshouse.mjs from beside itself.
+const HOOK_FILES = ["glasshouse.mjs", "glasshouse.sh"];
 
 // ---- pure / parameterized functions -------------------------------------
 
@@ -38,36 +41,43 @@ function buildConfig({ email, url, key }) {
   return config;
 }
 
-function copyHookScript(repoRoot, claudeHome) {
+function copyHookScripts(repoRoot, claudeHome) {
   const hooksDir = path.join(claudeHome, "hooks");
   fs.mkdirSync(hooksDir, { recursive: true });
-  fs.copyFileSync(
-    path.join(repoRoot, "glasshouse-plugin", "glasshouse.mjs"),
-    path.join(hooksDir, "glasshouse.mjs")
-  );
+  for (const file of HOOK_FILES) {
+    fs.copyFileSync(path.join(repoRoot, "glasshouse-plugin", file), path.join(hooksDir, file));
+  }
   return hooksDir;
+}
+
+function isGlasshouseHook(hook) {
+  return typeof hook?.command === "string" && /glasshouse\.(mjs|sh)/.test(hook.command);
+}
+
+// Drop every Glasshouse hook, whatever shape it is in. Matching `glasshouse.sh` alone
+// would leave a pre-1.1 `node ".../glasshouse.mjs"` entry in place and running beside
+// the new one — an upgrade has to replace the command, not add to it. Only our own
+// hooks go: an entry that mixes ours with someone else's keeps theirs.
+function withoutGlasshouseHooks(entries) {
+  return entries
+    .map((entry) => ({ ...entry, hooks: (entry.hooks || []).filter((h) => !isGlasshouseHook(h)) }))
+    .filter((entry) => entry.hooks.length > 0);
 }
 
 // Pure, no I/O: returns a new settings object with glasshouse hook entries
 // merged in. Never mutates the input.
 function mergeSettings(settings, hooksDir) {
   const result = structuredClone(settings);
-  const glasshouseMjsPath = path.join(hooksDir, "glasshouse.mjs").replace(/\\/g, "/");
-  const glasshouseCommand = `node "${glasshouseMjsPath}"`;
+  // glasshouse.sh, not glasshouse.mjs: the launcher finds a Node runtime first, because
+  // Claude Code ships its own and no longer leaves one on PATH. See docs/hook.md.
+  const launcherPath = path.join(hooksDir, "glasshouse.sh").replace(/\\/g, "/");
+  const glasshouseCommand = `sh "${launcherPath}"`;
 
   if (!result.hooks) result.hooks = {};
   for (const event of HOOK_EVENTS) {
-    if (!result.hooks[event]) result.hooks[event] = [];
-    const alreadyInstalled = result.hooks[event].some((entry) =>
-      (entry.hooks || []).some(
-        (h) => typeof h.command === "string" && h.command.includes("glasshouse.mjs")
-      )
-    );
-    if (alreadyInstalled) continue;
-    result.hooks[event].push({
-      matcher: "*",
-      hooks: [{ type: "command", command: glasshouseCommand }],
-    });
+    const kept = withoutGlasshouseHooks(result.hooks[event] || []);
+    kept.push({ matcher: "*", hooks: [{ type: "command", command: glasshouseCommand }] });
+    result.hooks[event] = kept;
   }
   return result;
 }
@@ -134,10 +144,18 @@ function selfCheck() {
 
   const tmpHooksDir = path.join(os.tmpdir(), "glasshouse-selfcheck-hooksdir");
 
+  // The hook must be launched through glasshouse.sh, never `node` directly: a bare
+  // `node` command prints `node: command not found` into the transcript on every tool
+  // call for anyone whose Claude Code came from the native installer or the desktop app.
+  function assertLaunchesViaWrapper(command) {
+    assert.ok(command.includes("glasshouse.sh"), `hook command must run the launcher, got: ${command}`);
+    assert.ok(!/^node\b/.test(command), `hook command must not invoke node directly, got: ${command}`);
+  }
+
   function checkMerged(merged) {
     assert.equal(merged.hooks.PreToolUse.length, 2);
     assert.deepStrictEqual(merged.hooks.PreToolUse[0], fixture.hooks.PreToolUse[0]);
-    assert.ok(merged.hooks.PreToolUse[1].hooks[0].command.includes("glasshouse.mjs"));
+    assertLaunchesViaWrapper(merged.hooks.PreToolUse[1].hooks[0].command);
     for (const event of ["SessionStart", "InstructionsLoaded", "SessionEnd"]) {
       assert.equal(merged.hooks[event].length, 1);
     }
@@ -153,11 +171,56 @@ function selfCheck() {
   // fixture itself must remain untouched by either call (mergeSettings is pure)
   assert.equal(fixture.hooks.PreToolUse.length, 1);
 
+  // Upgrading from a pre-1.1 install must REPLACE the old `node ".../glasshouse.mjs"`
+  // command, not append beside it — otherwise every event fires twice and the bare-node
+  // copy keeps erroring on machines with no Node.
+  const legacy = {
+    hooks: {
+      PreToolUse: [
+        { matcher: "Bash", hooks: [{ type: "command", command: "node /other/tool.mjs" }] },
+        { matcher: "*", hooks: [{ type: "command", command: 'node "/old/hooks/glasshouse.mjs"' }] },
+      ],
+      SessionStart: [
+        { matcher: "*", hooks: [{ type: "command", command: 'node "/old/hooks/glasshouse.mjs"' }] },
+      ],
+    },
+  };
+  const upgraded = mergeSettings(legacy, tmpHooksDir);
+  for (const event of HOOK_EVENTS) {
+    const commands = upgraded.hooks[event].flatMap((e) => e.hooks.map((h) => h.command));
+    const ours = commands.filter((c) => c.includes("glasshouse"));
+    assert.equal(ours.length, 1, `${event} must end up with exactly one glasshouse hook`);
+    assertLaunchesViaWrapper(ours[0]);
+  }
+  // ...while leaving the unrelated hook that shared the event alone.
+  assert.deepStrictEqual(upgraded.hooks.PreToolUse[0], legacy.hooks.PreToolUse[0]);
+
+  // A glasshouse hook sharing an entry with someone else's keeps theirs.
+  const shared = mergeSettings(
+    {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "*",
+            hooks: [
+              { type: "command", command: 'node "/old/hooks/glasshouse.mjs"' },
+              { type: "command", command: "node /someone/else.mjs" },
+            ],
+          },
+        ],
+      },
+    },
+    tmpHooksDir,
+  );
+  assert.deepStrictEqual(shared.hooks.PreToolUse[0].hooks, [
+    { type: "command", command: "node /someone/else.mjs" },
+  ]);
+
   // edge case: settings object with no `hooks` key at all (the `if (!result.hooks)` branch)
   const emptyMerged = mergeSettings({}, tmpHooksDir);
   for (const event of HOOK_EVENTS) {
     assert.equal(emptyMerged.hooks[event].length, 1);
-    assert.ok(emptyMerged.hooks[event][0].hooks[0].command.includes("glasshouse.mjs"));
+    assertLaunchesViaWrapper(emptyMerged.hooks[event][0].hooks[0].command);
   }
 
   // buildConfig: email-only by default, url/key included only when given.
@@ -167,7 +230,7 @@ function selfCheck() {
     { userEmail: "a@example.com", supabaseUrl: "https://x", supabasePublishableKey: "k" },
   );
 
-  // writeConfig / copyHookScript, isolated in their own temp dir
+  // writeConfig / copyHookScripts, isolated in their own temp dir
   const tmpClaudeHome = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-selfcheck-"));
   try {
     const config = {
@@ -181,11 +244,15 @@ function selfCheck() {
     );
     assert.deepStrictEqual(writtenConfig, config);
 
+    // Both files, byte-identical. Copying only the .mjs would leave settings.json
+    // pointing at a launcher that is not there, and the hook would never run at all.
     const repoRoot = path.dirname(fileURLToPath(import.meta.url));
-    copyHookScript(repoRoot, tmpClaudeHome);
-    const copied = fs.readFileSync(path.join(tmpClaudeHome, "hooks", "glasshouse.mjs"), "utf8");
-    const source = fs.readFileSync(path.join(repoRoot, "glasshouse-plugin", "glasshouse.mjs"), "utf8");
-    assert.equal(copied, source);
+    copyHookScripts(repoRoot, tmpClaudeHome);
+    for (const file of HOOK_FILES) {
+      const copied = fs.readFileSync(path.join(tmpClaudeHome, "hooks", file), "utf8");
+      const source = fs.readFileSync(path.join(repoRoot, "glasshouse-plugin", file), "utf8");
+      assert.equal(copied, source, `${file} must be copied byte-for-byte`);
+    }
 
     // edge case: real first-run scenario — settings.json does not exist yet
     const settingsPath = path.join(tmpClaudeHome, "settings.json");
@@ -220,7 +287,7 @@ function main() {
   const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
   writeConfig(claudeHome, buildConfig({ email, url: args.url, key: args.key }));
-  const hooksDir = copyHookScript(repoRoot, claudeHome);
+  const hooksDir = copyHookScripts(repoRoot, claudeHome);
   installSettings(claudeHome, hooksDir);
   console.log("Glasshouse installed.");
 }

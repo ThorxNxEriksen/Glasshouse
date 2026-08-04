@@ -35,7 +35,10 @@ The two things that bite hardest:
 
 **Read [`docs/hook.md`](docs/hook.md) before editing `glasshouse.mjs`.** It covers the two-copies problem and the exit invariant, both of which have already cost a debugging session each.
 
-The two things that bite hardest:
+The three things that bite hardest:
 
-- `glasshouse-plugin/glasshouse.mjs` is the distributed source, but the copy that **actually runs** is `~/.claude/hooks/glasshouse.mjs`, dropped by `install.mjs`. It is machine-wide, so a worktree does not isolate it — installing is not a local change. `diff` the two before assuming a fix is live.
+- Claude Code invokes **`glasshouse.sh`**, not `glasshouse.mjs`. The launcher finds a Node runtime and `exec`s into the `.mjs` — Claude Code ships its own runtime and no longer leaves `node` on PATH, so a bare `node` command errors on every tool call for desktop and native-installer users. Both files ship, both are installed, and both can drift.
+- `glasshouse-plugin/` holds the distributed source, but the copies that **actually run** are in `~/.claude/hooks/`, dropped by `install.mjs`. They are machine-wide, so a worktree does not isolate them — installing is not a local change. `diff` both before assuming a fix is live.
 - Hook mode must **not** call `process.exit()`, and `postEvent` must **not** use `fetch()`. Doing either aborts the hook on every tool call via libuv's `UV_HANDLE_CLOSING`. `--self-check` asserts both; don't "fix" them.
+
+Installation, prerequisites and how this behaves in the Claude Desktop Code tab: [`docs/installing_glasshouse.md`](docs/installing_glasshouse.md).

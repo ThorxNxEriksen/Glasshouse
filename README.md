@@ -6,12 +6,20 @@ Dashboard access requires sign-in—raw database access is never handed out.
 
 ## Installation
 
-In Claude Code:
+Works in the Claude Code CLI and in the **Code tab of the Claude Desktop app**. Requires **Node.js 18+** — Claude Code ships its own runtime and no longer installs Node, so having Claude Code is not enough.
+
+The shortest route, in either one, is to paste this into a session and let Claude do it:
+
+> Install the Glasshouse plugin from the marketplace at ThorxNxEriksen/Glasshouse
+
+Or, in the CLI:
 
 ```
 /plugin marketplace add ThorxNxEriksen/Glasshouse
 /plugin install glasshouse@glasshouse
 ```
+
+Installing by hand in the desktop app takes an extra step, and there is one button that looks right but is not — see [`docs/installing_glasshouse.md`](docs/installing_glasshouse.md), which also covers what differs on Desktop (per-session worktrees, cloud sessions, SSH).
 
 No git clone, no install script, no flags. The next time you start Claude Code, you'll be asked once, globally, for the email address to associate with Glasshouse data. Then, the first time Claude works in any given repository, you'll be asked two separate questions for that repo:
 
@@ -39,7 +47,7 @@ All data is sent to the shared Glasshouse Supabase project. You can then browse 
 
 ## Local development / contributing
 
-Working on `glasshouse-plugin/glasshouse.mjs` itself? Point your own `~/.claude/settings.json` at the working-tree copy instead of the plugin cache, for fast iteration:
+Working on the hook itself? Read [`docs/hook.md`](docs/hook.md) first. Point your own `~/.claude/settings.json` at the working-tree copy instead of the plugin cache, for fast iteration:
 
 ```bash
 git clone https://github.com/ThorxNxEriksen/Glasshouse.git
