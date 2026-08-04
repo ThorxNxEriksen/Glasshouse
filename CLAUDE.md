@@ -22,6 +22,7 @@ The two things that bite hardest:
 
 - `tool_name` is the literal `"Skill"` for every skill invocation — never the skill's own name, which lives in `tool_input.skill` (→ the `skill_name` column). Believing otherwise is what made the pipeline discard every skill name for weeks.
 - `tool_input.args` sits right beside the name and is **never** captured — it is free-text user content. A `--self-check` assertion enforces this; don't "fix" it.
+- A plugin is not a skill. Each plugin injects exactly **one** entry-point skill at `SessionStart` (uncountable, recorded by name in `always_on_skills`); every other skill it ships is a normal `Skill` call already counted in `skill_name`. Believing "superpowers is always-on, so its skills are invisible" is wrong and cost a rewrite — the three tiers are in §8.
 
 ## The hook
 
