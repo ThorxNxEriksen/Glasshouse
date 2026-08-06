@@ -1,6 +1,7 @@
 -- Claude Events Analytics Schema
 -- Supabase PostgreSQL schema for tracking Claude Code usage via hooks
 -- Never executed against any database in this plan
+-- TEMP-SENTINEL-EDIT-FOR-PR-GATE-PROOF
 
 -- Table: claude_events
 CREATE TABLE IF NOT EXISTS claude_events (
