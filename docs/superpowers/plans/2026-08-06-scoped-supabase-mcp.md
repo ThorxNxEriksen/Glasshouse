@@ -13,7 +13,7 @@
 - **Project refs (verified 2026-08-06 via `list_projects`, org `idjybbrfxklsnqnydiwb`):**
   - `smzccpjmakavoxlsrvku` — **Glasshouse**, region `eu-north-1`. Confirmed in `frontend/.env.local` and hardcoded at `glasshouse-plugin/glasshouse.mjs:26`.
   - `djftqoqbdlrhsgsfpstv` — **clotta-meal-tracker**, region `eu-west-2`. Confirmed in `C:/dev/meal-tracker-top/meal-tracker/.env.local`.
-- **Server URL form:** `https://mcp.supabase.com/mcp?project_ref=<ref>`. Per Supabase docs the hosted server accepts exactly three query params — `project_ref`, `read_only`, `features`. Do **not** add `read_only=true`: backlog item #1 requires `apply_migration` against Glasshouse.
+- **Server URL form:** `https://mcp.supabase.com/mcp?project_ref=<ref>`. Per Supabase docs the hosted server accepts exactly three query params — `project_ref`, `read_only`, `features`. Do **not** add `read_only=true`: backlog item #3 requires `apply_migration` against Glasshouse.
 - **OAuth grants are keyed by the full server URL including query string.** Changing or adding a `project_ref` invalidates any existing grant for that entry — re-authentication after every URL change is expected, not a failure.
 - **`~/.claude.json` is rewritten by every running Claude Code session on exit.** Any hand-edit can be silently clobbered. Use the `claude mcp` CLI, and prefer having no other sessions open during Task 1.
 - **There are three config profiles, and only one is authoritative.** `CLAUDE_CONFIG_DIR` selects between them:
@@ -41,7 +41,7 @@
 
   Related: a `PreToolUse` hook at `~/.claude/hooks/profile-config.mjs` blocks Write/Edit against `CLAUDE.md`, `settings.json`, and `commands/` inside a profile directory, redirecting to `~/.claude`. It deliberately does **not** cover `.claude.json` — that file is handled by the launcher merge above, which is why a `claude mcp remove` in a profile session fails silently rather than being blocked.
 - **Do not touch** the per-project `disabledMcpServers: ['drawio']` entries under `C:/dev/glasshouse` and `C:/dev/internal-market-intelligence`. Unrelated, and dropping them re-enables a server that fails to connect.
-- **`claude.ai Supabase` must stay disabled.** It is unscoped (`https://mcp.supabase.com/mcp`, no ref). Re-enabling it restores exactly the account-wide access this plan removes, and re-creates the duplicate that Glasshouse's own `backlog.md` #5 describes.
+- **`claude.ai Supabase` must stay disabled.** It is unscoped (`https://mcp.supabase.com/mcp`, no ref). Re-enabling it restores exactly the account-wide access this plan removes, and re-creates the duplicate that Glasshouse's own `backlog.md` #7 describes.
 
 ---
 
@@ -347,4 +347,4 @@ Found during diagnosis, deliberately not in this plan — each is independent an
 - **`vercel` is duplicated** (`vercel` and `claude.ai Vercel`, both `mcp.vercel.com`, both `! Needs authentication`) — the same duplicate-OAuth-registration problem, unsolved. Vercel's MCP has no project-scoping query param, so the fix is "delete one", not "scope both".
 - **`drawio` fails to connect** — `npx -y @drawio/mcp` returns `-32000: Connection closed`. Already suppressed per-project via `disabledMcpServers` in two repos; the user-scoped entry should probably just be removed.
 - **14 unauthenticated claude.ai connectors** (Asana, Box, Canva, ClickUp, Figma, Gamma, HubSpot, Intercom, Linear, monday.com, Operating, Otter.ai, Snowflake, Webflow) contribute ~28 dead tool names to every tool search. Disconnecting is done in claude.ai connector settings, not the `claude mcp` CLI.
-- **`backlog.md` #5** (two Supabase servers rendering as near-identical labels) is partly resolved by Task 1: with `claude.ai Supabase` disabled and the local entry scoped, future events carry one label per service. The historical split rows remain, so the item still needs a decision about old data.
+- **`backlog.md` #7** (two Supabase servers rendering as near-identical labels) is partly resolved by Task 1: with `claude.ai Supabase` disabled and the local entry scoped, future events carry one label per service. The historical split rows remain, so the item still needs a decision about old data.
