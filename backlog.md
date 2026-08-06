@@ -166,3 +166,25 @@ The version that fits is a view over the `tool_name` sequence already stored —
 Edit/Write-heavy → build, Read/Grep with no writes → plan, repeated Read→Edit on
 one file → debug. Weak proxy: it will misread sessions that plan first, build
 second. Drop the idea if the buckets read as noise.
+
+## 13. "Pull from target before opening a PR" — enforce via hook, not memory
+
+`CLAUDE.md` states the rule (global instructions: "Pull from the target branch
+before creating PRs") but nothing checks it — it only holds as long as the agent
+remembers to read it. A `PreToolUse` hook gating `gh pr create` (or a git
+pre-push check comparing local `HEAD` against `origin/<base>`) would catch a
+stale branch mechanically instead of relying on instruction-following. Not
+started; raised as a question, not a decision — worth weighing against the
+false-positive cost of blocking a legitimate PR command.
+
+## 14. Auto-enter a worktree on SessionStart / after `/clear` — enforce via hook, not memory
+
+Same shape as #13. Global instructions say "Use EnterWorktree for all work. Do
+not work on master/main," but that only holds if the agent remembers it after
+a fresh `SessionStart` or a `/clear`, both of which drop conversation context
+without dropping the working directory. A `SessionStart` hook (and whatever
+hook fires on `/clear`, if any) that checks the cwd isn't a worktree and runs
+`EnterWorktree` automatically would make this mechanical. Not started; also
+worth weighing false positives — e.g. sessions that are deliberately read-only
+or already scoped to a non-default branch shouldn't be forced into a new
+worktree.
