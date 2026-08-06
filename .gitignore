@@ -1,0 +1,6 @@
+# Git worktrees created inside the repo (--worktree / EnterWorktree).
+# Scoped to worktrees/ so project config added under .claude/ later is still tracked.
+.claude/worktrees/
+
+# Playwright MCP scratch output: console logs and page snapshots.
+.playwright-mcp/
