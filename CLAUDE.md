@@ -14,6 +14,24 @@ The exposure control belongs one layer down: **each user decides how much of the
 
 `frontend/vercel.json` pins `"framework": "nextjs"`. The Project Settings preset was "Other", which ran `next build` and then served only `frontend/public/` as static files — every app route returned a platform 404 while `/next.svg` returned 200. Keep the preset in `vercel.json`, not in dashboard state a checkout can't see.
 
+## Supabase access
+
+`.mcp.json` pins the Supabase MCP to `project_ref=smzccpjmakavoxlsrvku`
+(**Glasshouse**, `eu-north-1`) — the project behind `frontend/.env.local`
+and `glasshouse-plugin/glasshouse.mjs`.
+
+The scope is the safety mechanism, not a convenience. `project_ref`
+disables account-level tools, so there is no reachable path from this repo
+to another project — a migration cannot land on the wrong database. Do not
+"fix" an auth prompt by adding an unscoped `supabase` server at user scope
+or re-enabling the `claude.ai Supabase` connector; both restore
+account-wide reach. Re-authenticate the scoped entry instead: `/mcp`.
+
+OAuth grants are keyed by the full URL including the query string, so
+editing the ref always requires a fresh sign-in. That is expected.
+
+MCP server config is machine-wide and lives in the **default** profile (`~/.claude.json`). `claude-work` and `claude-personal` overwrite their `mcpServers` key from it on every launch (`Sync-ClaudeMcpServers`), so a `claude mcp add`/`remove` run inside a profile session reports success and then silently reverts at next start. Change MCP servers in the default profile, or not at all.
+
 ## Reading data in the dashboard
 
 Two failure modes here are silent — they produce plausible wrong numbers instead of an error:
