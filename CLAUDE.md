@@ -14,6 +14,16 @@ The exposure control belongs one layer down: **each user decides how much of the
 
 `frontend/vercel.json` pins `"framework": "nextjs"`. The Project Settings preset was "Other", which ran `next build` and then served only `frontend/public/` as static files — every app route returned a platform 404 while `/next.svg` returned 200. Keep the preset in `vercel.json`, not in dashboard state a checkout can't see.
 
+## Supabase access
+
+`.mcp.json` pins the Supabase MCP to `project_ref=smzccpjmakavoxlsrvku` (**Glasshouse**, `eu-north-1`) — the project behind `frontend/.env.local` and `glasshouse-plugin/glasshouse.mjs`.
+
+The scope is meant to be the safety mechanism, not a convenience: per Supabase's MCP documentation, `project_ref=<id>` "scopes to a specific project (disables account tools)", so a correctly scoped entry should leave no reachable path from this repo to another project — a migration should not be able to land on the wrong database. That has **not** been confirmed in this setup — the acceptance test (authenticate the scoped entry, then attempt `mcp__supabase__list_projects` and confirm the tool does not exist at all) requires human OAuth and has not been run yet. Treat the isolation as configured, not verified, until that check has been done. Regardless of that gap, do not "fix" an auth prompt by adding an unscoped `supabase` server at user scope or re-enabling the `claude.ai Supabase` connector; both restore account-wide reach. Re-authenticate the scoped entry instead: `/mcp`.
+
+OAuth grants are keyed by the full URL including the query string, so editing the ref always requires a fresh sign-in. That is expected.
+
+MCP server config is machine-wide and lives in the **default** profile (`~/.claude.json`). `claude-work` and `claude-personal` overwrite their `mcpServers` key from it on every launch (`Sync-ClaudeMcpServers`), so a `claude mcp add`/`remove` run inside a profile session reports success and then silently reverts at next start. Change MCP servers in the default profile, or not at all.
+
 ## Reading data in the dashboard
 
 Two failure modes here are silent — they produce plausible wrong numbers instead of an error:
