@@ -5,7 +5,31 @@ not just what — a line nobody can act on is worse than no line.
 
 ---
 
-## 1. Aggregate server-side; stop shipping raw events to the browser
+## 1. Profile MCP config edits silently revert on next launch
+
+**Why now.** `CLAUDE_CONFIG_DIR` selects one of three config profiles — default
+(`~/.claude.json`), `claude-work`, `claude-personal`. `Sync-ClaudeMcpServers`, in
+`~/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1`, runs at every
+`claude-work` / `claude-personal` launch and does `target.mcpServers =
+canonical.mcpServers` — a wholesale replace from the default profile. So `claude mcp
+add` / `claude mcp remove` run inside a work or personal session writes the profile
+copy, reports success, and is confirmed by `claude mcp list` — then silently reverts at
+the next launch. This actually happened during this plan's Task 1; it was caught only
+because the end state was verified by reading all three config files directly, not by
+trusting `claude mcp list`.
+
+There is already a `PreToolUse` hook at `~/.claude/hooks/profile-config.mjs` that blocks
+exactly this class of mistake for `CLAUDE.md`, `settings.json`, and `commands/`,
+redirecting the edit to `~/.claude`. It deliberately excludes `.claude.json`, on the
+reasoning that the launcher merge handles it — which it does at launch, but not in the
+window in between.
+
+Suggested direction, not a decision: extend that guard to catch MCP-config writes
+against a profile's `.claude.json`, or have the launcher warn on drift. This is machine
+setup, not Glasshouse code, so it may belong in the user's dotfiles rather than this
+repo — flagging the question rather than answering it.
+
+## 2. Aggregate server-side; stop shipping raw events to the browser
 
 **Why now.** The profile page fetches raw `claude_events` rows and aggregates in the
 client. PostgREST caps every response at 1000 rows, so the page can only ever see a
@@ -49,7 +73,7 @@ consent gating — see the comment above `public_profile_events`):
   the global + per-repo viewer.
 
 MCP counts are derived from `tool_name` prefixes, not stored — keep that derivation in
-one place if it moves server-side, and see item 5 first.
+one place if it moves server-side, and see item 6 first.
 
 **Carry over, don't lose:** the mode-segment maths moves into SQL as
 `lead(client_ts) over (partition by session_id order by client_ts)`, with the
@@ -62,17 +86,17 @@ tool totals but not per-name, exactly as `aggregateSessions` does now.
 Once this lands, `public_profile_events` should have no remaining consumer. Drop it
 rather than leave a raw-event view exposed.
 
-## 2. Time-windowed views ("last week", not just lifetime) — deferred
+## 3. Time-windowed views ("last week", not just lifetime) — deferred
 
 **Explicitly not wanted yet** (decided 2026-08-04); lifetime figures are enough for now.
-Recorded because it is the obvious next ask once #1 lands, and cheap at that point:
+Recorded because it is the obvious next ask once #2 lands, and cheap at that point:
 filter or group `public_session_summary` by period to show "last 7 days" alongside
-all-time. Do it **after** #1 — windowing raw events would just re-create the 1000-row
+all-time. Do it **after** #2 — windowing raw events would just re-create the 1000-row
 problem with extra steps.
 
 Until then, any figure labelled as a total should say what it actually covers.
 
-## 3. `install.mjs` bare run wipes Supabase credentials
+## 4. `install.mjs` bare run wipes Supabase credentials
 
 `buildConfig` only writes `supabaseUrl` / `supabasePublishableKey` when passed as
 `--url` / `--key`, so a plain `node install.mjs` rewrites
@@ -80,7 +104,7 @@ Until then, any figure labelled as a total should say what it actually covers.
 ability to post. It should merge over the existing config instead of replacing it.
 Hit during the always-on-skills work; worked around by passing the current values back in.
 
-## 4. `file_path` is captured with no consent gate
+## 5. `file_path` is captured with no consent gate
 
 `row.file_path` on `PreToolUse` holds absolute paths into private projects, OS username
 included, while every other identifying field (`permission_mode`, `repo_name`,
@@ -89,7 +113,7 @@ included, while every other identifying field (`permission_mode`, `repo_name`,
 edit away, and `sanitizeRaw` already deletes `transcript_path` for exactly this reason.
 Gate it on activity consent, or reduce it at capture. See `docs/recording_skills.md` §9.
 
-## 5. Two MCP servers render as near-identical labels
+## 6. Two MCP servers render as near-identical labels
 
 `parseMcpServer` (`frontend/lib/mcp.ts`) strips the `claude_ai_` prefix, so the
 claude.ai-hosted server and a local one of the same name collapse to labels differing
@@ -99,7 +123,18 @@ double-counting, but a viewer can't tell that and it reads as a bug. Either dist
 them (`Supabase (claude.ai)` vs `supabase (local)`) or merge them deliberately; the
 current middle ground is the only wrong answer.
 
-## 6. `public_user_directory` ignores activity consent
+**Update (2026-08-06).** Cause confirmed: genuinely two different servers, not a
+labelling bug — the user ran both a claude.ai-hosted connector and a local
+user-scoped server for the same service. Supabase is now resolved at the source: the
+claude.ai connector was disabled and the local server replaced by a project-scoped
+`.mcp.json` (`project_ref=smzccpjmakavoxlsrvku`), so newly captured events carry one
+label per service. Vercel is **not** resolved — `vercel` and `claude.ai Vercel` both
+still exist, both point at `mcp.vercel.com`, and both report `! Needs authentication`.
+Vercel's MCP has no project-scoping query parameter, so the fix there is "delete one,"
+not "scope both." Either way the historical rows stay split — deciding what to do with
+the old data is the part that's still open.
+
+## 7. `public_user_directory` ignores activity consent
 
 It lists any user with a non-null `user_email` from *any* event. `InstructionsLoaded`
 rows carry `user_email` gated only on `claudeMd` sharing, so someone who shares their
@@ -108,11 +143,11 @@ written up in `docs/recording_skills.md` §3.
 
 ---
 
-Items 7–12 are carried over from `PLAN.md` (removed 2026-08-04 — every design
+Items 8–13 are carried over from `PLAN.md` (removed 2026-08-04 — every design
 section in it was built, and its auth model contradicted the public dashboard;
 see git history). Longer horizon than the above, not newer.
 
-## 7. Authentication — planned
+## 8. Authentication — planned
 
 Intended, not merely deferred. Scope undecided; **the constraint is that auth is
 additive.** It must not become a reason to gate the public views — `CLAUDE.md` is
@@ -127,34 +162,34 @@ unreferenced by any page. The `emailRedirectTo` comment there records an
 already-debugged bug.
 
 Decide *what sign-in is for* before building the flow — the mechanism is solved.
-Candidates: owner-only view of your own data, a consent-management UI, and #8.
+Candidates: owner-only view of your own data, a consent-management UI, and #9.
 
-## 8. Per-user retroactive visibility controls
+## 9. Per-user retroactive visibility controls
 
 Withdrawing your own already-sent rows, beyond the per-repo consent decision made
 before anything is sent. Deferred because consent already stops unwanted data at
 the source; more plausible now that profiles are publicly browsable by email.
-Largely blocked on #7 — withdrawing your rows requires proving which are yours.
+Largely blocked on #8 — withdrawing your rows requires proving which are yours.
 
-## 9. Smarter CLAUDE.md redaction
+## 10. Smarter CLAUDE.md redaction
 
 `redacted` is headings-only plus a line/char count: a structural summary, not
 PII-grade scrubbing. Known ceiling, accepted deliberately. Upgrade to
 secret/pattern scrubbing only if headings-only proves too thin or too revealing.
 
-## 10. Local buffering / retry queue for hook POSTs
+## 11. Local buffering / retry queue for hook POSTs
 
 Hook POSTs go straight to PostgREST with a short abort timeout; offline or failed
 sends are dropped. Deferred because a failed POST must never interrupt a session
 and a retry queue is more machinery than the data is worth. Revisit only if gaps
 visibly distort the dashboard.
 
-## 11. OTel Collector
+## 12. OTel Collector
 
 Not used; hooks POST directly to PostgREST. A documented alternative only if
 hook-based permission-mode diffing proves too coarse.
 
-## 12. Per-session work-type classification
+## 13. Per-session work-type classification
 
 Bucket sessions as build / debug / refactor / analyse / plan / prototype / docs —
 taxonomy borrowed from Claude Code's built-in `/team-onboarding`.
@@ -167,7 +202,7 @@ Edit/Write-heavy → build, Read/Grep with no writes → plan, repeated Read→E
 one file → debug. Weak proxy: it will misread sessions that plan first, build
 second. Drop the idea if the buckets read as noise.
 
-## 13. "Pull from target before opening a PR" — enforce via hook, not memory
+## 14. "Pull from target before opening a PR" — enforce via hook, not memory
 
 `CLAUDE.md` states the rule (global instructions: "Pull from the target branch
 before creating PRs") but nothing checks it — it only holds as long as the agent
@@ -177,9 +212,9 @@ stale branch mechanically instead of relying on instruction-following. Not
 started; raised as a question, not a decision — worth weighing against the
 false-positive cost of blocking a legitimate PR command.
 
-## 14. Auto-enter a worktree on SessionStart / after `/clear` — enforce via hook, not memory
+## 15. Auto-enter a worktree on SessionStart / after `/clear` — enforce via hook, not memory
 
-Same shape as #13. Global instructions say "Use EnterWorktree for all work. Do
+Same shape as #14. Global instructions say "Use EnterWorktree for all work. Do
 not work on master/main," but that only holds if the agent remembers it after
 a fresh `SessionStart` or a `/clear`, both of which drop conversation context
 without dropping the working directory. A `SessionStart` hook (and whatever
