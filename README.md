@@ -22,7 +22,7 @@ Or, in the CLI:
 /plugin install glasshouse@glasshouse
 ```
 
-Installing by hand in the desktop app takes an extra step, and there is one button that looks right but is not — see [`docs/installing_glasshouse.md`](docs/installing_glasshouse.md), which also covers what differs on Desktop (per-session worktrees, cloud sessions, SSH).
+Installing by hand in the desktop app takes an extra step — see [`docs/installing_glasshouse.md`](docs/installing_glasshouse.md), which also covers what differs on Desktop (per-session worktrees, cloud sessions, SSH).
 
 No git clone, no install script, no flags. The next time you start Claude Code, you'll be asked once, globally, for the email address to associate with Glasshouse data. Then, the first time Claude works in any given repository, you'll be asked two separate questions for that repo:
 

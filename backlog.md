@@ -209,3 +209,36 @@ hook fires on `/clear`, if any) that checks the cwd isn't a worktree and runs
 worth weighing false positives — e.g. sessions that are deliberately read-only
 or already scoped to a non-default branch shouldn't be forced into a new
 worktree.
+
+## 15. Verify the plugin-marketplace install route on desktop (post-merge)
+
+Everything else in the desktop work has been observed on a real Code tab session:
+the `glasshouse.sh` launcher runs, no `hook error` appears, and a full session in
+`meal-tracker` (`f296862a`) recorded SessionStart → MCP call → AskUserQuestion →
+Glob → 3× Read → SessionEnd. Consent is asked once per repo and survives desktop's
+per-session worktrees.
+
+**Untested: the install route the README leads with.**
+
+> Install the Glasshouse plugin from the marketplace at ThorxNxEriksen/Glasshouse
+
+It could not be tested while the work was in flight, for two reasons:
+
+- `/plugin marketplace add` clones the repo's **default branch**. Until the
+  desktop-support PR merged that was v1.0.1 — no launcher, bare `node` command —
+  so the test would have exercised the old release and proved nothing.
+- This machine has Glasshouse installed via `install.mjs`, which writes hook
+  entries straight into `~/.claude/settings.json`. A plugin install adds a
+  *second* set of hooks from `plugin.json`, so every event fires twice and lands
+  duplicate rows under one email — on the public dashboard, inflating every total
+  until they are deleted.
+
+To run it: remove the four `glasshouse.sh` entries from `~/.claude/settings.json`
+first (or use a second machine), then paste the line above into a fresh Code tab
+session. Confirm the marketplace registers, the plugin installs, `/reload-plugins`
+activates it, and exactly **one** row per event lands. Restore the `install.mjs`
+hooks afterwards.
+
+Also unverified: `git_branch` on desktop should name the session's worktree
+branch. It is not exposed in any `public_*` view, so checking it needs the
+Supabase MCP or direct table access, not the dashboard.

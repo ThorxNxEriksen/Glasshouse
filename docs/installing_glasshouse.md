@@ -59,14 +59,6 @@ claude plugin install glasshouse@glasshouse
 
 Then `/reload-plugins`.
 
-> [!WARNING]
-> **Customize → Plugins is a different plugin system.** The desktop app has an **Add
-> marketplace** button under Customize → Plugins, and it accepts a GitHub repository, so
-> it looks like the right place. It is not. That surface syncs through your claude.ai
-> account and feeds the **Chat and Cowork tabs**, not the Code tab's `~/.claude`
-> directory. Adding Glasshouse there will show it as installed while installing nothing
-> that runs in the Code tab: no hook, no data, and no error to tell you so.
-
 ## What is different on Desktop
 
 **Every session gets its own git worktree.** For git repositories the desktop app isolates
@@ -90,7 +82,12 @@ answer would be discarded with the VM. Your local sessions are unaffected.
 available in WSL sessions at all.
 
 **The Cowork tab is out of scope.** It sources its configuration from your claude.ai
-account rather than `~/.claude`, so Glasshouse does not see it — see the warning above.
+account rather than `~/.claude`, so Glasshouse does not see it.
+
+**Customize → Plugins is not a separate world.** Plugins installed into `~/.claude` do
+show up there — observed in the Code tab, with `~/.claude`-installed plugins listed. What
+the **Add marketplace** button in that panel writes to has not been tested, so install via
+the routes above rather than through it.
 
 ## Contributing
 
