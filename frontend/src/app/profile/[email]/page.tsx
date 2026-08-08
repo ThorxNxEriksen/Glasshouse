@@ -33,21 +33,40 @@ import { PLUGIN_GITHUB_URLS } from "../skillLinks";
 import { getSupabaseClient } from "../../../../lib/supabaseClient";
 import { parseMcpServer } from "../../../../lib/mcp";
 
-interface EventRow {
-  session_id: string | null;
-  user_email: string | null;
-  hook_event_name: string | null;
-  tool_name: string | null;
-  skill_name: string | null;
-  permission_mode: string | null;
+interface SessionRow {
+  user_email: string;
+  session_id: string;
   repo_name: string | null;
-  content: string | null;
+  started_at: string;
+  ended_at: string;
+  active_ms: number;
+  wallclock_ms: number;
+  segments: { mode: string; ms: number }[];
+  tool_counts: Record<string, number>;
+  skill_counts: Record<string, number>;
+  agent_calls: number;
+}
+interface UserTotals {
+  session_count: number;
+  repo_day_run_count: number;
+  repo_count: number;
+  active_ms: number;
+  tool_counts: Record<string, number>;
+  skill_counts: Record<string, number>;
+}
+interface UserSnapshot {
   installed_hooks: Record<string, string[]> | null;
+  // client_ts of the same row installed_hooks came from — null iff installed_hooks is.
+  installed_hooks_ts: string | null;
   enabled_plugins: string[] | null;
   // One entry per plugin that injects a skill at SessionStart — a strict subset of
   // enabled_plugins. skill is null when the name couldn't be inferred safely.
   always_on_skills: { plugin: string; skill: string | null }[] | null;
-  raw: Record<string, unknown> | null;
+}
+interface ClaudeMdRow {
+  memory_type: string;
+  repo_name: string | null;
+  content: string;
   client_ts: string;
 }
 
@@ -72,12 +91,6 @@ const MODE_LABELS: Record<string, string> = {
   waiting: "Waiting for input",
 };
 
-// ponytail: naive fixed-ceiling idle heuristic — any gap longer than this is
-// treated as the user stepping away rather than active work in that mode.
-// Upgrade path: derive the threshold from each user's own gap distribution
-// instead of one constant for everybody, if this starts misclassifying long
-// but genuine active-mode segments as idle.
-const IDLE_GAP_MS = 3 * 60 * 1000;
 function modeColor(mode: string) {
   return MODE_COLORS[mode] ?? "var(--grey-300)";
 }
@@ -100,83 +113,23 @@ function dayLabel(ms: number) {
   return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-interface SessionAgg {
-  sessionId: string;
-  repoKey: string;
-  startMs: number;
-  endMs: number;
-  segments: { mode: string; ms: number }[];
-  toolCounts: Record<string, number>;
-  skillCounts: Record<string, number>;
-  agentCalls: number;
+// Adapts a public_session_summary row to the shape the timeline code below
+// already speaks (sessionId/repoKey/startMs/endMs/...), so buildRun and
+// groupSessionsByRepoDay don't need to change at all.
+function toAgg(r: SessionRow) {
+  return {
+    sessionId: r.session_id,
+    repoKey: r.repo_name ?? "(unknown repo)",
+    startMs: new Date(r.started_at).getTime(),
+    endMs: new Date(r.ended_at).getTime(),
+    segments: r.segments,
+    activeMs: r.active_ms,
+    toolCounts: r.tool_counts,
+    skillCounts: r.skill_counts,
+    agentCalls: r.agent_calls,
+  };
 }
-
-function mergeSegments(raw: { mode: string; ms: number }[]): { mode: string; ms: number }[] {
-  const merged: { mode: string; ms: number }[] = [];
-  for (const seg of raw) {
-    const last = merged[merged.length - 1];
-    if (last && last.mode === seg.mode) {
-      last.ms += seg.ms;
-    } else {
-      merged.push({ mode: seg.mode, ms: seg.ms });
-    }
-  }
-  return merged;
-}
-
-function aggregateSessions(rows: EventRow[]): SessionAgg[] {
-  const bySession = new Map<string, EventRow[]>();
-  for (const row of rows) {
-    if (!row.session_id || !row.client_ts) continue;
-    const list = bySession.get(row.session_id);
-    if (list) list.push(row);
-    else bySession.set(row.session_id, [row]);
-  }
-
-  const sessions: SessionAgg[] = [];
-  for (const [sessionId, sessionRows] of bySession) {
-    sessionRows.sort((a, b) => new Date(a.client_ts).getTime() - new Date(b.client_ts).getTime());
-    const repoKey = sessionRows.find((r) => r.repo_name)?.repo_name ?? "(unknown repo)";
-    const times = sessionRows.map((r) => new Date(r.client_ts).getTime());
-    const rawSegments: { mode: string; ms: number }[] = [];
-    const toolCounts: Record<string, number> = {};
-    const skillCounts: Record<string, number> = {};
-    let agentCalls = 0;
-
-    for (let i = 0; i < sessionRows.length; i++) {
-      const row = sessionRows[i];
-      if (row.permission_mode && i + 1 < sessionRows.length) {
-        rawSegments.push({ mode: row.permission_mode, ms: times[i + 1] - times[i] });
-      }
-      if (row.hook_event_name === "PreToolUse" && row.tool_name) {
-        toolCounts[row.tool_name] = (toolCounts[row.tool_name] ?? 0) + 1;
-        if (row.tool_name === "Skill") {
-          // skill_name is null on rows captured before it was a column — those
-          // still count toward toolCounts above, just not per-name below.
-          if (row.skill_name) skillCounts[row.skill_name] = (skillCounts[row.skill_name] ?? 0) + 1;
-        }
-        if (row.tool_name === "Agent") agentCalls += 1;
-      }
-    }
-
-    // Gaps longer than IDLE_GAP_MS are idle time, not active mode time —
-    // bucket those into "waiting" before merging same-mode runs together.
-    const reclassified = rawSegments.map((seg) => (seg.ms > IDLE_GAP_MS ? { mode: "waiting", ms: seg.ms } : seg));
-    const segments = mergeSegments(reclassified);
-
-    sessions.push({
-      sessionId,
-      repoKey,
-      startMs: times[0],
-      endMs: times[times.length - 1],
-      segments,
-      toolCounts,
-      skillCounts,
-      agentCalls,
-    });
-  }
-  return sessions;
-}
+type SessionAgg = ReturnType<typeof toAgg>;
 
 interface Terminal {
   label: string | null;
@@ -190,23 +143,6 @@ interface RunGroup {
   totalMs: number;
   agents: number;
   terminals: Terminal[];
-}
-
-// Active time excludes "waiting" segments (idle gaps reclassified by the
-// IDLE_GAP_MS heuristic) — used for every aggregate that claims to measure
-// time actually spent working, not wall-clock span.
-function activeMs(session: SessionAgg): number {
-  return session.segments.filter((seg) => seg.mode !== "waiting").reduce((sum, seg) => sum + seg.ms, 0);
-}
-
-function mergeCounts(sessions: SessionAgg[], key: "toolCounts" | "skillCounts"): Record<string, number> {
-  const merged: Record<string, number> = {};
-  for (const s of sessions) {
-    for (const [name, count] of Object.entries(s[key])) {
-      merged[name] = (merged[name] ?? 0) + count;
-    }
-  }
-  return merged;
 }
 
 function buildRun(cluster: SessionAgg[]): RunGroup {
@@ -280,66 +216,72 @@ export default function ProfilePage() {
   // server-side `params` prop does, so an encodeURIComponent'd link (e.g.
   // "%40" for "@") arrives here still encoded.
   const email = rawEmail ? decodeURIComponent(rawEmail) : rawEmail;
-  const [rows, setRows] = useState<EventRow[] | null>(null);
+  const [totals, setTotals] = useState<UserTotals | null>(null);
+  const [sessionRows, setSessionRows] = useState<SessionRow[] | null>(null);
+  const [snapshot, setSnapshot] = useState<UserSnapshot | null>(null);
+  const [claudeMd, setClaudeMd] = useState<ClaudeMdRow[]>([]);
   const [selectedRepoKey, setSelectedRepoKey] = useState<string | null>(null);
 
   useEffect(() => {
     if (!email) return;
     let cancelled = false;
-    getSupabaseClient()
-      .from("public_profile_events")
-      .select(
-        "session_id,user_email,hook_event_name,tool_name,skill_name,permission_mode,repo_name,content,installed_hooks,enabled_plugins,always_on_skills,raw,client_ts"
-      )
-      .eq("user_email", email)
-      // PostgREST caps every response at 1000 rows regardless of what's
-      // requested here (confirmed via Content-Range on the live project) —
-      // ascending order meant a growing table only ever returned its OLDEST
-      // rows, silently dropping all recent activity. Descending gets the
-      // newest window instead; downstream aggregation re-sorts per-session
-      // so order here doesn't otherwise matter.
-      .order("client_ts", { ascending: false })
-      // To match PostgREST's db-max-rows setting
-      .limit(1000)
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        setRows(!error && data ? (data as EventRow[]) : []);
-      });
+    const client = getSupabaseClient();
+
+    Promise.all([
+      client.from("public_user_totals").select("*").eq("user_email", email).maybeSingle(),
+      client
+        .from("public_session_summary")
+        .select("*")
+        .eq("user_email", email)
+        // PostgREST caps every response at 1000 rows regardless of what's
+        // requested here (confirmed via Content-Range on the live project) —
+        // ~43 sessions per user leaves huge headroom, but keep the ceiling
+        // explicit since PostgREST enforces it silently.
+        .order("started_at", { ascending: false })
+        .limit(1000),
+      client.from("public_user_snapshot").select("*").eq("user_email", email).maybeSingle(),
+      client.from("public_claude_md_latest").select("*").eq("user_email", email),
+    ]).then(([totalsRes, sessionsRes, snapshotRes, claudeMdRes]) => {
+      if (cancelled) return;
+      setTotals(!totalsRes.error && totalsRes.data ? (totalsRes.data as UserTotals) : null);
+      setSessionRows(!sessionsRes.error && sessionsRes.data ? (sessionsRes.data as SessionRow[]) : []);
+      setSnapshot(!snapshotRes.error && snapshotRes.data ? (snapshotRes.data as UserSnapshot) : null);
+      setClaudeMd(!claudeMdRes.error && claudeMdRes.data ? (claudeMdRes.data as ClaudeMdRow[]) : []);
+    });
 
     return () => {
       cancelled = true;
     };
   }, [email]);
 
-  const sessions = useMemo(() => (rows ? aggregateSessions(rows) : []), [rows]);
-  const runs = useMemo(() => groupSessionsByRepoDay(sessions), [sessions]);
+  // Mapped once and shared by groupSessionsByRepoDay, repoList, and
+  // selectedRepo below, so the timeline code keeps reading s.activeMs /
+  // s.toolCounts without a second pass over sessionRows.
+  const aggs = useMemo(() => (sessionRows ? sessionRows.map(toAgg) : []), [sessionRows]);
+  const runs = useMemo(() => groupSessionsByRepoDay(aggs), [aggs]);
 
-  if (rows === null) return null;
+  if (sessionRows === null) return null;
 
-  const heroRuns = runs.length;
-  const heroMs = sessions.reduce((sum, s) => sum + activeMs(s), 0);
-  const heroHours = Math.round(heroMs / 3600000) + "h";
-  const heroRepos = new Set(sessions.map((s) => s.repoKey)).size;
+  const heroRuns = totals?.repo_day_run_count ?? 0;
+  const heroHours = Math.round((totals?.active_ms ?? 0) / 3600000) + "h";
+  const heroRepos = totals?.repo_count ?? 0;
 
-  const allTools = mergeCounts(sessions, "toolCounts");
+  const allTools = totals?.tool_counts ?? {};
 
   // Invoked skills: countable, because each one is a real Skill tool call.
-  const allSkills = mergeCounts(sessions, "skillCounts");
+  const allSkills = totals?.skill_counts ?? {};
   const totalSkillCalls = Object.values(allSkills).reduce((a, b) => a + b, 0);
   const maxSkillCount = Math.max(1, ...topEntries(allSkills, 8).map(([, c]) => c));
   const skillBars = topEntries(allSkills, 8).map(([name, count]) => ({ name, count, pct: (count / maxSkillCount) * 100 }));
 
-  // The two static measurements, both "as of the most recent session that reported
-  // one". Deliberately separate: enabled plugins are a capability surface (what is
-  // installed), always-on skills are the one skill per plugin that is in context
-  // every session and can never appear as a Skill call. Neither is a count.
-  const latestWith = <K extends keyof EventRow>(key: K) =>
-    rows
-      .filter((r) => (r[key] as unknown[] | null)?.length)
-      .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0]?.[key];
-
-  const enabledPlugins = latestWith("enabled_plugins") ?? [];
-  const alwaysOnSkills = latestWith("always_on_skills") ?? [];
+  // The two static measurements. Deliberately separate: enabled plugins are a
+  // capability surface (what is installed), always-on skills are the one
+  // skill per plugin that is in context every session and can never appear
+  // as a Skill call. Neither is a count.
+  const enabledPlugins = snapshot?.enabled_plugins ?? [];
+  const alwaysOnSkills = snapshot?.always_on_skills ?? [];
+  const installedHooks = snapshot?.installed_hooks ?? null;
+  const installedHooksTs = snapshot?.installed_hooks_ts ?? null;
 
   const mcpCounts: Record<string, number> = {};
   for (const [tool, count] of Object.entries(allTools)) {
@@ -349,18 +291,16 @@ export default function ProfilePage() {
   const maxMcpCount = Math.max(1, ...topEntries(mcpCounts, 5).map(([, c]) => c));
   const mcpBars = topEntries(mcpCounts, 5).map(([name, count]) => ({ name, count, pct: (count / maxMcpCount) * 100 }));
 
-  const instructionRows = rows.filter((r) => r.hook_event_name === "InstructionsLoaded").sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime());
-  const globalRow = instructionRows.find((r) => r.raw?.memory_type === "User");
-  const recentProjectRow = instructionRows.find((r) => r.raw?.memory_type === "Project" || r.raw?.memory_type === undefined);
-
-  const latestHookRow = rows
-    .filter((r) => r.hook_event_name === "SessionStart" && r.installed_hooks)
+  // public_claude_md_latest carries exactly one User-scope row per user.
+  const globalRow = claudeMd.find((r) => r.memory_type === "User");
+  const recentProjectRow = claudeMd
+    .filter((r) => r.memory_type === "Project")
     .sort((a, b) => new Date(b.client_ts).getTime() - new Date(a.client_ts).getTime())[0];
 
-  const repoList = Array.from(new Set(sessions.map((s) => s.repoKey)))
+  const repoList = Array.from(new Set(aggs.map((s) => s.repoKey)))
     .map((repoKey) => {
-      const repoSessions = sessions.filter((s) => s.repoKey === repoKey);
-      const hours = repoSessions.reduce((sum, s) => sum + activeMs(s), 0) / 3600000;
+      const repoSessions = aggs.filter((s) => s.repoKey === repoKey);
+      const hours = repoSessions.reduce((sum, s) => sum + s.activeMs, 0) / 3600000;
       const lastActiveMs = Math.max(...repoSessions.map((s) => s.endMs));
       return { repoKey, name: repoKey, runs: repoSessions.length, hours, lastActiveMs };
     })
@@ -396,14 +336,21 @@ export default function ProfilePage() {
   const selectedRepo = selectedRepoKey
     ? (() => {
         const meta = repoList.find((r) => r.repoKey === selectedRepoKey);
-        const repoSessions = sessions.filter((s) => s.repoKey === selectedRepoKey);
-        const tools = mergeCounts(repoSessions, "toolCounts");
+        const repoSessions = aggs.filter((s) => s.repoKey === selectedRepoKey);
+        const tools: Record<string, number> = {};
+        for (const s of repoSessions) {
+          for (const [name, count] of Object.entries(s.toolCounts)) {
+            tools[name] = (tools[name] ?? 0) + count;
+          }
+        }
         const mcp: Record<string, number> = {};
         for (const [tool, count] of Object.entries(tools)) {
           const server = parseMcpServer(tool);
           if (server) mcp[server] = (mcp[server] ?? 0) + count;
         }
-        const claudeMdRow = instructionRows.find((r) => (r.repo_name ?? "(unknown repo)") === selectedRepoKey && r.content);
+        const claudeMdRow = claudeMd.find(
+          (r) => r.memory_type === "Project" && (r.repo_name ?? "(unknown repo)") === selectedRepoKey && r.content
+        );
         return {
           repoKey: selectedRepoKey,
           name: selectedRepoKey,
@@ -565,13 +512,13 @@ export default function ProfilePage() {
             <Card>
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 <Badge tone="warning">hooks</Badge>
-                {latestHookRow ? (
+                {installedHooks ? (
                   <>
                     <p style={{ margin: 0, fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                      Registered on your machine · {formatRelative(new Date(latestHookRow.client_ts).getTime())}
+                      Registered on your machine{installedHooksTs && ` · ${formatRelative(new Date(installedHooksTs).getTime())}`}
                     </p>
                     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                      {Object.entries(latestHookRow.installed_hooks ?? {}).map(([eventName, matchers]) => (
+                      {Object.entries(installedHooks).map(([eventName, matchers]) => (
                         <div key={eventName} style={{ display: "flex", flexDirection: "column", gap: 4, paddingBottom: 8, borderBottom: "1px solid var(--border-subtle)" }}>
                           <span style={{ fontSize: "var(--text-sm)", fontWeight: "var(--weight-bold)", color: "var(--text-strong)" }}>{eventName}</span>
                           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>

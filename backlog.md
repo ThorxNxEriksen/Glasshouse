@@ -99,9 +99,113 @@ double-counting, but a viewer can't tell that and it reads as a bug. Either dist
 them (`Supabase (claude.ai)` vs `supabase (local)`) or merge them deliberately; the
 current middle ground is the only wrong answer.
 
-## 6. `public_user_directory` ignores activity consent
+## 6. Reverse the consent model: activity is the price of entry, CLAUDE.md is the option
 
-It lists any user with a non-null `user_email` from *any* event. `InstructionsLoaded`
-rows carry `user_email` gated only on `claudeMd` sharing, so someone who shares their
-CLAUDE.md but declines activity sharing still appears with a `run_count`. Already
-written up in `docs/recording_skills.md` §3.
+**Decided 2026-08-04.** Today there are two independent per-repo consents — `claudeMd`
+(none/redacted/full) and `activity` (yes/no) — and they are the wrong way round.
+Activity data is tool names, skill names and timings. CLAUDE.md is free text that can
+carry client names, personal notes, or something a user pasted without thinking. The
+sensitive one is the one currently allowed to ride along beside an activity opt-out.
+
+**Target model:** installing Glasshouse *is* the activity consent — someone who doesn't
+want their activity shared shouldn't install it. CLAUDE.md stays optional and hideable,
+and becomes the only question at first run (none / redacted / full). That deletes the
+`consent.activity === "yes"` gates in `glasshouse.mjs` and the matching nulling of
+`permission_mode`, `repo_name`, `enabled_plugins` and `always_on_skills` in `buildRow`.
+
+**This subsumes the original item 6** (`public_user_directory` lists any user with a
+non-null `user_email` from *any* event, so a claudeMd-only user appears with a
+`run_count` — `docs/recording_skills.md` §3). Same root cause: `InstructionsLoaded` is
+gated on `claudeMd` while the other three events are gated on `activity`, so
+claudeMd-only rows leak activity-shaped facts. Verified during the aggregation work:
+1 of 43 sessions for the only current user is built purely from `InstructionsLoaded`
+rows, which is why `public_session_summary` counts it. Once activity is mandatory that
+asymmetry cannot arise and no per-view filter is needed.
+
+**Do not skip:** a consent record already saying `activity: no` was a promise. Changing
+the gate does not change what those users agreed to — honour existing records or re-ask
+before their activity starts flowing. Only new installs get the new model by default.
+Latent-only today: the sole user has activity consent.
+
+---
+
+Items 7–12 are carried over from `PLAN.md` (removed 2026-08-04 — every design
+section in it was built, and its auth model contradicted the public dashboard;
+see git history). Longer horizon than the above, not newer.
+
+## 7. Authentication — planned
+
+Intended, not merely deferred. Scope undecided; **the constraint is that auth is
+additive.** It must not become a reason to gate the public views — `CLAUDE.md` is
+explicit that no login between visitor and dashboard is the product.
+
+Already in the tree and **not dead code — do not clean it up**: the
+`authenticated`-granted views in `schema.sql` (`claude_md_session`,
+`permission_mode_summary`, `session_tool_usage`, `session_skill_usage`,
+`session_hooks_installed`), read by nothing today; plus `sendMagicLink` in
+`frontend/lib/supabaseClient.ts` and `frontend/lib/useSupabaseSession.ts`, both
+unreferenced by any page. The `emailRedirectTo` comment there records an
+already-debugged bug.
+
+Decide *what sign-in is for* before building the flow — the mechanism is solved.
+Candidates: owner-only view of your own data, a consent-management UI, and #8.
+
+## 8. Per-user retroactive visibility controls
+
+Withdrawing your own already-sent rows, beyond the per-repo consent decision made
+before anything is sent. Deferred because consent already stops unwanted data at
+the source; more plausible now that profiles are publicly browsable by email.
+Largely blocked on #7 — withdrawing your rows requires proving which are yours.
+
+## 9. Smarter CLAUDE.md redaction
+
+`redacted` is headings-only plus a line/char count: a structural summary, not
+PII-grade scrubbing. Known ceiling, accepted deliberately. Upgrade to
+secret/pattern scrubbing only if headings-only proves too thin or too revealing.
+
+## 10. Local buffering / retry queue for hook POSTs
+
+Hook POSTs go straight to PostgREST with a short abort timeout; offline or failed
+sends are dropped. Deferred because a failed POST must never interrupt a session
+and a retry queue is more machinery than the data is worth. Revisit only if gaps
+visibly distort the dashboard.
+
+## 11. OTel Collector
+
+Not used; hooks POST directly to PostgREST. A documented alternative only if
+hook-based permission-mode diffing proves too coarse.
+
+## 12. Per-session work-type classification
+
+Bucket sessions as build / debug / refactor / analyse / plan / prototype / docs —
+taxonomy borrowed from Claude Code's built-in `/team-onboarding`.
+
+**Don't copy its method.** That command classifies from each session's *first user
+message*; free-text prompts are exactly what `sanitizeRaw` refuses to transmit, and
+a label inferred from text we never published is covered by no consent category.
+The version that fits is a view over the `tool_name` sequence already stored —
+Edit/Write-heavy → build, Read/Grep with no writes → plan, repeated Read→Edit on
+one file → debug. Weak proxy: it will misread sessions that plan first, build
+second. Drop the idea if the buckets read as noise.
+
+## 13. "Pull from target before opening a PR" — enforce via hook, not memory
+
+`CLAUDE.md` states the rule (global instructions: "Pull from the target branch
+before creating PRs") but nothing checks it — it only holds as long as the agent
+remembers to read it. A `PreToolUse` hook gating `gh pr create` (or a git
+pre-push check comparing local `HEAD` against `origin/<base>`) would catch a
+stale branch mechanically instead of relying on instruction-following. Not
+started; raised as a question, not a decision — worth weighing against the
+false-positive cost of blocking a legitimate PR command.
+
+## 14. Auto-enter a worktree on SessionStart / after `/clear` — enforce via hook, not memory
+
+Same shape as #13. Global instructions say "Use EnterWorktree for all work. Do
+not work on master/main," but that only holds if the agent remembers it after
+a fresh `SessionStart` or a `/clear`, both of which drop conversation context
+without dropping the working directory. A `SessionStart` hook (and whatever
+hook fires on `/clear`, if any) that checks the cwd isn't a worktree and runs
+`EnterWorktree` automatically would make this mechanical. Not started; also
+worth weighing false positives — e.g. sessions that are deliberately read-only
+or already scoped to a non-default branch shouldn't be forced into a new
+worktree.

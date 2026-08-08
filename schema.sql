@@ -251,3 +251,177 @@ FROM latest_session_start, LATERAL jsonb_array_elements(always_on_skills) AS ent
 GROUP BY 1, 2 ORDER BY user_count DESC;
 REVOKE ALL ON public_always_on_adoption FROM anon, authenticated;
 GRANT SELECT ON public_always_on_adoption TO anon, authenticated;
+
+-- public_session_summary: per-session rollup that replaces the client-side
+-- aggregateSessions/mergeSegments/activeMs trio in
+-- frontend/src/app/profile/[email]/page.tsx. Reproduces two behaviours of
+-- that JS that are easy to drop: (a) adjacent same-mode segments are merged
+-- (the "islands" trick below), and (b) repo_name is the FIRST non-null value
+-- in chronological order, not the min.
+CREATE OR REPLACE VIEW public_session_summary AS
+WITH ev AS (
+  SELECT user_email, session_id, repo_name, permission_mode, hook_event_name,
+         tool_name, skill_name, client_ts,
+         lead(client_ts) OVER (PARTITION BY session_id ORDER BY client_ts) AS next_ts
+  FROM claude_events
+  WHERE session_id IS NOT NULL AND user_email IS NOT NULL
+),
+-- Gaps longer than the idle threshold are the user stepping away, not time
+-- spent in that mode. Same rule as IDLE_GAP_MS in the frontend.
+seg_raw AS (
+  SELECT session_id, client_ts,
+         CASE WHEN (extract(epoch FROM (next_ts - client_ts)) * 1000) > 180000
+              THEN 'waiting' ELSE permission_mode END AS mode,
+         (extract(epoch FROM (next_ts - client_ts)) * 1000)::bigint AS ms
+  FROM ev
+  WHERE permission_mode IS NOT NULL AND next_ts IS NOT NULL
+),
+-- Islands trick: row_number() over the partition minus row_number() over the
+-- partition-plus-mode is constant across a run of consecutive same-mode rows
+-- and changes whenever the mode changes, so grouping by it merges adjacent
+-- same-mode segments (mirrors the client's mergeSegments).
+islands AS (
+  SELECT *,
+         row_number() OVER (PARTITION BY session_id ORDER BY client_ts)
+       - row_number() OVER (PARTITION BY session_id, mode ORDER BY client_ts) AS grp
+  FROM seg_raw
+),
+merged AS (
+  SELECT session_id, mode, sum(ms) AS ms, min(client_ts) AS seg_start
+  FROM islands GROUP BY session_id, mode, grp
+),
+seg AS (
+  SELECT session_id,
+         jsonb_agg(jsonb_build_object('mode', mode, 'ms', ms) ORDER BY seg_start) AS segments,
+         coalesce(sum(ms) FILTER (WHERE mode <> 'waiting'), 0)::bigint AS active_ms
+  FROM merged GROUP BY session_id
+),
+tools AS (
+  SELECT session_id,
+         jsonb_object_agg(tool_name, n) AS tool_counts,
+         coalesce(sum(n) FILTER (WHERE tool_name = 'Agent'), 0)::bigint AS agent_calls
+  FROM (SELECT session_id, tool_name, count(*) AS n FROM claude_events
+        WHERE hook_event_name = 'PreToolUse' AND tool_name IS NOT NULL
+        GROUP BY session_id, tool_name) t
+  GROUP BY session_id
+),
+-- skill_name is null on rows captured before 2026-08-03; those still count in
+-- tool_counts as 'Skill' but cannot be counted per name.
+skills AS (
+  SELECT session_id, jsonb_object_agg(skill_name, n) AS skill_counts
+  FROM (SELECT session_id, skill_name, count(*) AS n FROM claude_events
+        WHERE hook_event_name = 'PreToolUse' AND skill_name IS NOT NULL
+        GROUP BY session_id, skill_name) s
+  GROUP BY session_id
+),
+base AS (
+  SELECT user_email, session_id,
+         (array_agg(repo_name ORDER BY client_ts) FILTER (WHERE repo_name IS NOT NULL))[1] AS repo_name,
+         min(client_ts) AS started_at, max(client_ts) AS ended_at
+  FROM ev GROUP BY user_email, session_id
+)
+SELECT b.user_email, b.session_id, b.repo_name, b.started_at, b.ended_at,
+       coalesce(seg.active_ms, 0) AS active_ms,
+       (extract(epoch FROM (b.ended_at - b.started_at)) * 1000)::bigint AS wallclock_ms,
+       coalesce(seg.segments, '[]'::jsonb) AS segments,
+       coalesce(tools.tool_counts, '{}'::jsonb) AS tool_counts,
+       coalesce(skills.skill_counts, '{}'::jsonb) AS skill_counts,
+       coalesce(tools.agent_calls, 0) AS agent_calls
+FROM base b
+LEFT JOIN seg ON seg.session_id = b.session_id
+LEFT JOIN tools ON tools.session_id = b.session_id
+LEFT JOIN skills ON skills.session_id = b.session_id;
+REVOKE ALL ON public_session_summary FROM anon, authenticated;
+GRANT SELECT ON public_session_summary TO anon, authenticated;
+
+-- Per-user rollups built on public_session_summary, not claude_events, so the
+-- idle-time rule stays defined in exactly one place.
+--
+-- session_count and repo_day_run_count are deliberately different numbers:
+-- session_count counts sessions (public_session_summary rows), while
+-- repo_day_run_count counts distinct (repo, UTC day) pairs -- the frontend
+-- confusingly calls both "runs" (heroRuns vs repoList[].runs); this view
+-- keeps the names distinct instead of collapsing them.
+CREATE OR REPLACE VIEW public_user_totals AS
+WITH per_name AS (
+  SELECT user_email, key AS name, sum(value::bigint) AS n, 'tool' AS kind
+  FROM public_session_summary, jsonb_each_text(tool_counts) GROUP BY 1, 2
+  UNION ALL
+  SELECT user_email, key AS name, sum(value::bigint) AS n, 'skill' AS kind
+  FROM public_session_summary, jsonb_each_text(skill_counts) GROUP BY 1, 2
+)
+SELECT s.user_email,
+       count(*) AS session_count,
+       -- Matches the frontend's UTC dayKey(); a local-time cast would differ.
+       count(DISTINCT (coalesce(s.repo_name, '(unknown repo)'),
+                       (s.started_at AT TIME ZONE 'UTC')::date)) AS repo_day_run_count,
+       count(DISTINCT coalesce(s.repo_name, '(unknown repo)')) AS repo_count,
+       coalesce(sum(s.active_ms), 0)::bigint AS active_ms,
+       coalesce((SELECT jsonb_object_agg(name, n) FROM per_name p
+                 WHERE p.user_email = s.user_email AND p.kind = 'tool'), '{}'::jsonb) AS tool_counts,
+       coalesce((SELECT jsonb_object_agg(name, n) FROM per_name p
+                 WHERE p.user_email = s.user_email AND p.kind = 'skill'), '{}'::jsonb) AS skill_counts,
+       min(s.started_at) AS first_seen,
+       max(s.ended_at) AS last_seen
+FROM public_session_summary s
+GROUP BY s.user_email;
+REVOKE ALL ON public_user_totals FROM anon, authenticated;
+GRANT SELECT ON public_user_totals TO anon, authenticated;
+
+-- Per-user configuration snapshot. The three fields come from three
+-- independently-chosen rows: installed_hooks from the newest SessionStart
+-- that has one, enabled_plugins/always_on_skills each from the newest row
+-- with a NON-EMPTY array -- which may be a different row from the other two.
+-- A single DISTINCT ON over all three columns would silently force them to
+-- come from one row, so this stays three correlated subqueries.
+CREATE OR REPLACE VIEW public_user_snapshot AS
+WITH emails AS (
+  SELECT DISTINCT user_email FROM claude_events WHERE user_email IS NOT NULL
+)
+SELECT e.user_email,
+       (SELECT installed_hooks FROM claude_events c
+        WHERE c.user_email = e.user_email AND c.hook_event_name = 'SessionStart'
+          AND c.installed_hooks IS NOT NULL
+        ORDER BY c.client_ts DESC LIMIT 1) AS installed_hooks,
+       (SELECT enabled_plugins FROM claude_events c
+        WHERE c.user_email = e.user_email
+          AND jsonb_array_length(coalesce(c.enabled_plugins, '[]'::jsonb)) > 0
+        ORDER BY c.client_ts DESC LIMIT 1) AS enabled_plugins,
+       (SELECT always_on_skills FROM claude_events c
+        WHERE c.user_email = e.user_email
+          AND jsonb_array_length(coalesce(c.always_on_skills, '[]'::jsonb)) > 0
+        ORDER BY c.client_ts DESC LIMIT 1) AS always_on_skills,
+       -- Same row as installed_hooks above (identical predicate/order), just
+       -- projecting client_ts instead -- lets the "· X ago" label use the
+       -- timestamp of the row the hooks actually came from. Appended last so
+       -- CREATE OR REPLACE VIEW can add it without a DROP.
+       (SELECT c.client_ts FROM claude_events c
+        WHERE c.user_email = e.user_email AND c.hook_event_name = 'SessionStart'
+          AND c.installed_hooks IS NOT NULL
+        ORDER BY c.client_ts DESC LIMIT 1) AS installed_hooks_ts
+FROM emails e;
+REVOKE ALL ON public_user_snapshot FROM anon, authenticated;
+GRANT SELECT ON public_user_snapshot TO anon, authenticated;
+
+-- Newest CLAUDE.md per user: one row per repo for Project-scope files, but a
+-- single row for User-scope (the global ~/.claude/CLAUDE.md is not
+-- repo-scoped -- it gets re-logged once per session tagged with whichever
+-- repo that session happened to be in, so keying by repo_name for it would
+-- fragment one file into N stale-or-fresh copies and let an unordered
+-- consumer surface an old one). memory_type comes out of raw as a plain
+-- column so raw itself never reaches a public view.
+CREATE OR REPLACE VIEW public_claude_md_latest AS
+SELECT DISTINCT ON (user_email, coalesce(raw->>'memory_type', 'Project'),
+                     CASE WHEN coalesce(raw->>'memory_type', 'Project') = 'User'
+                          THEN NULL ELSE coalesce(repo_name, '(unknown repo)') END)
+       user_email,
+       coalesce(raw->>'memory_type', 'Project') AS memory_type,
+       repo_name, content, client_ts
+FROM claude_events
+WHERE hook_event_name = 'InstructionsLoaded' AND content IS NOT NULL AND user_email IS NOT NULL
+ORDER BY user_email, coalesce(raw->>'memory_type', 'Project'),
+         CASE WHEN coalesce(raw->>'memory_type', 'Project') = 'User'
+              THEN NULL ELSE coalesce(repo_name, '(unknown repo)') END,
+         client_ts DESC;
+REVOKE ALL ON public_claude_md_latest FROM anon, authenticated;
+GRANT SELECT ON public_claude_md_latest TO anon, authenticated;

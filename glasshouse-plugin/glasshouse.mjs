@@ -9,8 +9,11 @@
 //
 // Claude Code never invokes this file directly: settings.json and plugin.json both point
 // at glasshouse.sh beside it, which locates a Node runtime first and execs into here.
-// Editing this file alone is therefore not enough to change what runs — see
-// docs/hook.md ("Two copies of the hook") and docs/installing_glasshouse.md.
+// Editing this file alone is therefore not enough to change what runs.
+//
+// Read docs/hook.md before editing — it covers the two-copies problem and the exit
+// invariant, both of which have already cost a debugging session. Installation and
+// desktop specifics are in docs/installing_glasshouse.md.
 //
 // Ships as part of the Claude Code plugin (${CLAUDE_PLUGIN_ROOT}/) and is also usable
 // standalone via install.mjs for local development.

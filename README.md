@@ -2,7 +2,10 @@
 
 **Glasshouse** is a public, shared analytics pipeline for how people use Claude Code. It captures usage data (CLAUDE.md content, hooks, skills, MCP usage, time-per-permission-mode) via hooks and ships it to Supabase, with a Vercel-hosted dashboard for browsing the results.
 
-Dashboard access requires sign-in—raw database access is never handed out.
+The dashboard is public: no sign-in stands between a visitor and the data. That is
+the product, not an oversight. The control is one layer down — you decide, per repo
+and per category, what leaves your machine in the first place, and only what you
+opted into is ever published. Raw database access is never handed out.
 
 ## Installation
 
@@ -43,7 +46,7 @@ When enabled for a repository, Glasshouse records:
 - Which permission mode you're in over time (plan/auto/manual/etc.), used to measure time-per-mode — not what you approved or denied
 - Timing and metadata from your Claude Code session
 
-All data is sent to the shared Glasshouse Supabase project. You can then browse it via the Glasshouse dashboard (requires sign-in).
+Whatever you consented to share is sent to the shared Glasshouse Supabase project and published on the public Glasshouse dashboard, where anyone can browse it — including people without an account. Anything you did not opt into is never sent, so it never reaches the dashboard.
 
 ## Local development / contributing
 
