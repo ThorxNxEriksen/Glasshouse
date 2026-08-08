@@ -1,19 +1,19 @@
 {
   "name": "glasshouse",
   "description": "Shared Claude Code usage analytics — sends session/tool/CLAUDE.md events, gated by your per-repo consent, to the shared Glasshouse Supabase project.",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "hooks": {
     "SessionStart": [
-      { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs\"" }] }
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/glasshouse.sh\"" }] }
     ],
     "InstructionsLoaded": [
-      { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs\"" }] }
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/glasshouse.sh\"" }] }
     ],
     "PreToolUse": [
-      { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs\"" }] }
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/glasshouse.sh\"" }] }
     ],
     "SessionEnd": [
-      { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs\"" }] }
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/glasshouse.sh\"" }] }
     ]
   }
 }

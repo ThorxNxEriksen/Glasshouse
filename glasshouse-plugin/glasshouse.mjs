@@ -7,10 +7,16 @@
 //   node glasshouse.mjs set-email ...  → writes ~/.claude/glasshouse/config.json
 //   node glasshouse.mjs --self-check   → offline self-check, never touches real files/network
 //
-// Ships as the Claude Code plugin's hook script (${CLAUDE_PLUGIN_ROOT}/glasshouse.mjs)
-// and is also usable standalone via install.mjs for local development.
-// See docs/hook.md before editing this file — it covers the two-copies problem
-// and the exit invariant, both of which have already cost a debugging session.
+// Claude Code never invokes this file directly: settings.json and plugin.json both point
+// at glasshouse.sh beside it, which locates a Node runtime first and execs into here.
+// Editing this file alone is therefore not enough to change what runs.
+//
+// Read docs/hook.md before editing — it covers the two-copies problem and the exit
+// invariant, both of which have already cost a debugging session. Installation and
+// desktop specifics are in docs/installing_glasshouse.md.
+//
+// Ships as part of the Claude Code plugin (${CLAUDE_PLUGIN_ROOT}/) and is also usable
+// standalone via install.mjs for local development.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -18,7 +24,7 @@ import os from "node:os";
 import assert from "node:assert";
 import http from "node:http";
 import https from "node:https";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // Shared Glasshouse Supabase project — the publishable key is designed to be
@@ -525,23 +531,95 @@ function repoSourcePath(cwd) {
   }
 }
 
+// Compare content, not bytes: a line-ending difference is not real drift. Unreadable
+// on either side counts as "same" — not our business to guess.
+function filesDiffer(a, b) {
+  try {
+    const read = (p) => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+    return read(a) !== read(b);
+  } catch {
+    return false;
+  }
+}
+
 function hookDriftWarning(selfPath, sourcePath) {
   if (!selfPath || !sourcePath) return null;
   if (samePath(selfPath, sourcePath)) return null; // running the repo copy itself
-  try {
-    // Compare content, not bytes: a line-ending difference is not real drift.
-    const read = (p) => fs.readFileSync(p, "utf8").replace(/\r\n/g, "\n");
-    if (read(selfPath) === read(sourcePath)) return null;
-  } catch {
-    return null; // unreadable either side — not our business to guess
+
+  // install.mjs drops two files now, and glasshouse.sh rots more quietly than the hook
+  // it launches: a stale launcher still starts something, so nothing looks wrong.
+  const drifted = [];
+  if (filesDiffer(selfPath, sourcePath)) drifted.push("glasshouse.mjs");
+  const selfSh = path.join(path.dirname(selfPath), "glasshouse.sh");
+  const sourceSh = path.join(path.dirname(sourcePath), "glasshouse.sh");
+  if (fs.existsSync(selfSh) && fs.existsSync(sourceSh) && filesDiffer(selfSh, sourceSh)) {
+    drifted.push("glasshouse.sh");
   }
+  if (drifted.length === 0) return null;
+
   return (
-    `Glasshouse hook drift: the copy that is actually running differs from this checkout's source. ` +
-    `Running "${selfPath}", source "${sourcePath}". Whichever edit is newer is not live everywhere, ` +
-    `so diff the two and keep the union rather than overwriting one with the other, then re-run ` +
-    `\`node install.mjs\` to sync. Note the installed copy is machine-wide — every session in every ` +
-    `repo shares it, so a git worktree does not isolate it.`
+    `Glasshouse hook drift in ${drifted.join(" and ")}: the copy that is actually running differs ` +
+    `from this checkout's source. Running "${selfPath}", source "${sourcePath}". Whichever edit is ` +
+    `newer is not live everywhere, so diff the two and keep the union rather than overwriting one ` +
+    `with the other, then re-run \`node install.mjs\` to sync. Note the installed copy is ` +
+    `machine-wide — every session in every repo shares it, so a git worktree does not isolate it.`
   );
+}
+
+// ---------------------------------------------------------------------------
+// SessionStart notices
+// ---------------------------------------------------------------------------
+
+// Cloud sessions run on Anthropic-hosted VMs with no persistent ~/.claude. Asking for an
+// email there is worse than useless: the VM discards the answer, so the same prompt
+// returns next session, forever. Say what is true instead and ask for nothing.
+const CLOUD_SESSION_NOTICE =
+  `Glasshouse does not capture from cloud sessions. This one runs on an Anthropic-hosted VM with ` +
+  `no persistent ~/.claude, so no email or consent is on file here and nothing is being recorded. ` +
+  `The user's local sessions are unaffected. Mention this only if it comes up, and do not ask them ` +
+  `for an email address or consent answers in this session — any answer would be discarded when ` +
+  `the VM is torn down.`;
+
+// The two docs pages disagree about which variable exists, so check both rather than
+// betting on either.
+function isRemoteSession(env) {
+  return env?.CLAUDE_CODE_REMOTE === "true" || Boolean(env?.CLAUDE_CODE_REMOTE_SESSION_ID);
+}
+
+// Pure: everything it needs is a parameter, so selfCheck can assert on the exact text
+// without a session, a network, or a temp HOME.
+function buildSessionStartNotices({ config, consent, nodeCmd, hookPath, repoKey, driftWarning, isRemote }) {
+  if (isRemote) return [CLOUD_SESSION_NOTICE];
+
+  // Drift is reported alongside any consent/email prompt, not instead of it.
+  const notices = driftWarning ? [driftWarning] : [];
+
+  // glasshouse.sh sets nodeCmd only when it found the runtime somewhere PATH will not —
+  // there, a bare `node` would fail. Left bare and unquoted otherwise, because Claude
+  // runs these through PowerShell on Windows, where a quoted string is a value rather
+  // than a command to execute.
+  const node = nodeCmd === "node" ? "node" : JSON.stringify(nodeCmd);
+
+  if (!config) {
+    notices.push(
+      `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
+        `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
+        `data, then run: ${node} "${hookPath}" set-email --email "<email>". ` +
+        `Nothing is sent anywhere until that command runs. ` +
+        `This email will be shown on Glasshouse's public directory page and used in your profile's URL.`,
+    );
+  } else if (!consent) {
+    notices.push(
+      `Glasshouse usage analytics has no sharing preference on file for this repo yet. ` +
+        `Ask the user via AskUserQuestion, exactly two questions: ` +
+        `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
+        `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing + repo name) — yes / no. ` +
+        `Then run: ${node} "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
+        `Nothing is sent for this repo until that command runs.`,
+    );
+  }
+
+  return notices;
 }
 
 // ---------------------------------------------------------------------------
@@ -579,28 +657,22 @@ async function runHookMode() {
 
     if (eventName === "SessionStart") {
       const config = loadConfig(homeDir);
-      const hookPath = String(process.argv[1] ?? "").split(path.sep).join("/");
-      // Drift is reported alongside any consent/email prompt, not instead of it.
-      const notices = [hookDriftWarning(fileURLToPath(import.meta.url), repoSourcePath(cwd))];
+      const isRemote = isRemoteSession(process.env);
+      const notices = buildSessionStartNotices({
+        config,
+        consent,
+        nodeCmd: process.env.GLASSHOUSE_NODE || "node",
+        hookPath: String(process.argv[1] ?? "").split(path.sep).join("/"),
+        repoKey,
+        // A cloud session is not a checkout anyone is developing in; drift there is
+        // noise on top of a notice that already says nothing is being captured.
+        driftWarning: isRemote
+          ? null
+          : hookDriftWarning(fileURLToPath(import.meta.url), repoSourcePath(cwd)),
+        isRemote,
+      });
 
-      if (!config) {
-        notices.push(
-          `Glasshouse usage analytics has no email on file yet (this is asked once, globally, ` +
-            `not per-repo). Ask the user for the email address they want associated with Glasshouse ` +
-            `data, then run: node "${hookPath}" set-email --email "<email>". ` +
-            `Nothing is sent anywhere until that command runs. ` +
-            `This email will be shown on Glasshouse's public directory page and used in your profile's URL.`,
-        );
-      } else if (!consent) {
-        notices.push(
-          `Glasshouse usage analytics has no sharing preference on file for this repo yet. ` +
-            `Ask the user via AskUserQuestion, exactly two questions: ` +
-            `(1) CLAUDE.md sharing — none / redacted (default, recommended) / full; ` +
-            `(2) Activity sharing (tool/skill/MCP usage + permission-mode timing + repo name) — yes / no. ` +
-            `Then run: node "${hookPath}" consent --repo "${repoKey}" --claude-md <none|redacted|full> --activity <yes|no>. ` +
-            `Nothing is sent for this repo until that command runs.`,
-        );
-      } else if (consent.activity === "yes") {
+      if (config && consent && consent.activity === "yes") {
         await sendIfConsented(eventName, payload, consent, homeDir, settingsPath);
       }
 
@@ -1038,6 +1110,137 @@ async function selfCheck() {
     fs.rmSync(driftDir, { recursive: true, force: true });
   }
 
+  // The launcher drifts too, and on its own: glasshouse.mjs can be byte-identical while
+  // the glasshouse.sh beside it is stale. Needs two directories, since the check reads
+  // each side's sibling.
+  const shSelfDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-drift-self-"));
+  const shSrcDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-drift-src-"));
+  try {
+    const selfMjs = path.join(shSelfDir, "glasshouse.mjs");
+    const srcMjs = path.join(shSrcDir, "glasshouse.mjs");
+    fs.writeFileSync(selfMjs, "same\n");
+    fs.writeFileSync(srcMjs, "same\n");
+    assert.strictEqual(hookDriftWarning(selfMjs, srcMjs), null, "identical .mjs, no .sh present, must not warn");
+
+    fs.writeFileSync(path.join(shSelfDir, "glasshouse.sh"), "echo one\n");
+    assert.strictEqual(
+      hookDriftWarning(selfMjs, srcMjs),
+      null,
+      "a .sh on only one side is not drift — nothing to compare it against",
+    );
+
+    fs.writeFileSync(path.join(shSrcDir, "glasshouse.sh"), "echo two\n");
+    const shWarning = hookDriftWarning(selfMjs, srcMjs);
+    assert.ok(
+      shWarning && shWarning.includes("glasshouse.sh") && !shWarning.includes("glasshouse.mjs and"),
+      "a wrapper-only difference must warn, and name only the wrapper",
+    );
+
+    fs.writeFileSync(path.join(shSrcDir, "glasshouse.sh"), "echo one\r\n");
+    assert.strictEqual(hookDriftWarning(selfMjs, srcMjs), null, "wrapper line endings alone must not warn");
+
+    // Both files stale at once names both, so the fix instruction covers both.
+    fs.writeFileSync(srcMjs, "different\n");
+    fs.writeFileSync(path.join(shSrcDir, "glasshouse.sh"), "echo two\n");
+    const bothWarning = hookDriftWarning(selfMjs, srcMjs);
+    assert.ok(
+      bothWarning && bothWarning.includes("glasshouse.mjs and glasshouse.sh"),
+      "drift in both files must name both",
+    );
+  } finally {
+    fs.rmSync(shSelfDir, { recursive: true, force: true });
+    fs.rmSync(shSrcDir, { recursive: true, force: true });
+  }
+
+  // isRemoteSession: either variable is enough, and neither being set is local.
+  assert.strictEqual(isRemoteSession({ CLAUDE_CODE_REMOTE: "true" }), true);
+  assert.strictEqual(isRemoteSession({ CLAUDE_CODE_REMOTE_SESSION_ID: "session_abc" }), true);
+  assert.strictEqual(isRemoteSession({}), false);
+  assert.strictEqual(isRemoteSession({ CLAUDE_CODE_REMOTE: "false" }), false);
+
+  // Cloud sessions: exactly one notice, and none of the prompts. Asking for an email on
+  // a VM that discards the answer re-asks forever, which is the whole point of this
+  // branch — so assert the prompts are absent, not merely that something was returned.
+  const remoteNotices = buildSessionStartNotices({
+    config: null,
+    consent: undefined,
+    nodeCmd: "node",
+    hookPath: "/x/glasshouse.mjs",
+    repoKey: "git@github.com:o/r",
+    driftWarning: "drift happened",
+    isRemote: true,
+  });
+  assert.deepStrictEqual(remoteNotices, [CLOUD_SESSION_NOTICE]);
+  assert.strictEqual(remoteNotices.join("").includes("set-email"), false);
+  assert.strictEqual(remoteNotices.join("").includes("AskUserQuestion"), false);
+  assert.strictEqual(remoteNotices.join("").includes("drift happened"), false);
+
+  // Local, no config: the email prompt, preceded by any drift warning.
+  const emailNotices = buildSessionStartNotices({
+    config: null,
+    consent: undefined,
+    nodeCmd: "node",
+    hookPath: "/x/glasshouse.mjs",
+    repoKey: "git@github.com:o/r",
+    driftWarning: "drift happened",
+    isRemote: false,
+  });
+  assert.strictEqual(emailNotices.length, 2);
+  assert.strictEqual(emailNotices[0], "drift happened");
+  assert.ok(emailNotices[1].includes("set-email"));
+
+  // Local, config but no consent: the two-question prompt, carrying the repo key.
+  const consentNotices = buildSessionStartNotices({
+    config: { userEmail: "a@example.com" },
+    consent: undefined,
+    nodeCmd: "node",
+    hookPath: "/x/glasshouse.mjs",
+    repoKey: "git@github.com:o/r",
+    driftWarning: null,
+    isRemote: false,
+  });
+  assert.strictEqual(consentNotices.length, 1);
+  assert.ok(consentNotices[0].includes("consent --repo \"git@github.com:o/r\""));
+
+  // Fully configured and consented: nothing to say.
+  assert.deepStrictEqual(
+    buildSessionStartNotices({
+      config: { userEmail: "a@example.com" },
+      consent: { claudeMd: "none", activity: "yes" },
+      nodeCmd: "node",
+      hookPath: "/x/glasshouse.mjs",
+      repoKey: "k",
+      driftWarning: null,
+      isRemote: false,
+    }),
+    [],
+  );
+
+  // The interpreter glasshouse.sh resolved must be the one Claude is told to run — a bare
+  // `node` fails from the Bash tool whenever the launcher had to look off PATH, which is
+  // exactly the nvm/fnm/volta case the launcher exists to handle. But the default stays
+  // unquoted: Claude runs these commands through PowerShell on Windows, where "node" is
+  // a string literal rather than a command, so quoting it universally would break the
+  // majority case to serve the minority one.
+  const resolvedNode = "/home/u/.nvm/versions/node/v22.13.1/bin/node";
+  for (const [nodeCmd, expected] of [
+    ["node", `node "/x/glasshouse.mjs"`],
+    [resolvedNode, `"${resolvedNode}" "/x/glasshouse.mjs"`],
+  ]) {
+    for (const config of [null, { userEmail: "a@example.com" }]) {
+      const [notice] = buildSessionStartNotices({
+        config,
+        consent: undefined,
+        nodeCmd,
+        hookPath: "/x/glasshouse.mjs",
+        repoKey: "k",
+        driftWarning: null,
+        isRemote: false,
+      });
+      assert.ok(notice.includes(expected), `notice must invoke ${expected}, got: ${notice}`);
+    }
+  }
+
   // The Windows libuv abort ("!(handle->flags & UV_HANDLE_CLOSING)") that used
   // to fire on every tool call cannot be reproduced offline — it needs a real
   // remote socket. Loopback servers that answer instantly, answer slowly, or
@@ -1051,6 +1254,7 @@ async function selfCheck() {
   assert.ok(!postEvent.toString().includes("fetch("), "postEvent must not use fetch() — see its comment");
 
   await assertHookModePostsAndExits();
+  assertLauncherHandlesMissingNode();
 
   console.log("OK");
 }
@@ -1127,6 +1331,110 @@ function assertHookModePostsAndExits() {
       );
     });
   });
+}
+
+// glasshouse.sh is the hook's real entry point, and its whole reason to exist is the
+// machine this test cannot be run on: one with no Node at all. GLASSHOUSE_ASSUME_NO_NODE
+// stands in for that machine. Skipped where there is no POSIX shell to run it with
+// (native Windows without Git for Windows), which is also where the launcher itself
+// cannot run — see docs/installing_glasshouse.md.
+function assertLauncherHandlesMissingNode() {
+  const launcher = path.join(path.dirname(fileURLToPath(import.meta.url)), "glasshouse.sh");
+  if (!fs.existsSync(launcher)) {
+    throw new Error(`glasshouse.sh is missing next to glasshouse.mjs — the hook cannot start`);
+  }
+  // A CRLF checkout makes sh fail on every line with "$'\r': command not found".
+  // .gitattributes pins eol=lf; this catches a checkout that escaped it anyway.
+  assert.ok(
+    !fs.readFileSync(launcher, "utf8").includes("\r"),
+    "glasshouse.sh must have LF line endings — CRLF makes sh reject every line",
+  );
+  if (spawnSync("sh", ["-c", "exit 0"]).status !== 0) return; // no POSIX shell here
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "glasshouse-launcher-"));
+  try {
+    const run = (payload, home) =>
+      spawnSync("sh", [launcher], {
+        input: JSON.stringify(payload),
+        encoding: "utf8",
+        env: { ...process.env, GLASSHOUSE_ASSUME_NO_NODE: "1", HOME: home, USERPROFILE: home },
+      });
+
+    // SessionStart: exit 0, explain once, and remember that it explained.
+    const sessionHome = path.join(tmpDir, "session");
+    const first = run({ hook_event_name: "SessionStart", cwd: tmpDir }, sessionHome);
+    assert.strictEqual(first.status, 0, `launcher must exit 0 without node, got ${first.status}`);
+    const notice = JSON.parse(first.stdout);
+    assert.strictEqual(notice.hookSpecificOutput.hookEventName, "SessionStart");
+    assert.ok(
+      notice.hookSpecificOutput.additionalContext.includes("Node.js"),
+      "the no-node notice must name what is missing",
+    );
+    assert.ok(fs.existsSync(path.join(sessionHome, ".claude", "glasshouse", "node-missing-notified")));
+
+    // Second session: the marker suppresses it. Someone who has decided against
+    // installing Node should not be told again every session.
+    const second = run({ hook_event_name: "SessionStart", cwd: tmpDir }, sessionHome);
+    assert.strictEqual(second.status, 0);
+    assert.strictEqual(second.stdout.trim(), "", "the no-node notice must appear only once");
+
+    // Every other event: silent, and no marker — so a PreToolUse can never consume the
+    // one notice a SessionStart is owed.
+    const toolHome = path.join(tmpDir, "tool");
+    const tool = run({ hook_event_name: "PreToolUse", tool_name: "Bash", cwd: tmpDir }, toolHome);
+    assert.strictEqual(tool.status, 0, "a missing node must never fail a tool call");
+    assert.strictEqual(tool.stdout.trim(), "", "no output on non-SessionStart events");
+    assert.strictEqual(fs.existsSync(path.join(toolHome, ".claude")), false);
+
+    // Hand-off. The fake node reports the script it was given and whether the launcher
+    // exported an interpreter override, which is what buildSessionStartNotices spends.
+    const writeFakeNode = (dir) => {
+      fs.mkdirSync(dir, { recursive: true });
+      const fake = path.join(dir, "node");
+      fs.writeFileSync(fake, '#!/bin/sh\nprintf "%s|%s" "$1" "${GLASSHOUSE_NODE:-}"\n');
+      fs.chmodSync(fake, 0o755);
+      return fake;
+    };
+    const handOff = (env) => {
+      const r = spawnSync("sh", [launcher], { input: "{}", encoding: "utf8", env });
+      const [scriptArg, exported] = r.stdout.split("|");
+      assert.ok(scriptArg.endsWith("glasshouse.mjs"), `launcher must run glasshouse.mjs, got ${scriptArg}`);
+      return exported;
+    };
+
+    // Found on PATH: no override. A bare `node` already works from any shell, and an
+    // absolute quoted path would not be a runnable command in PowerShell — which is what
+    // Claude uses on Windows, where node is always on PATH when it is installed at all.
+    const pathBin = writeFakeNode(path.join(tmpDir, "onpath"));
+    assert.strictEqual(
+      handOff({ ...process.env, PATH: `${path.dirname(pathBin)}${path.delimiter}${process.env.PATH}` }),
+      "",
+      "a node already on PATH must not be overridden",
+    );
+
+    // Found off PATH — the nvm/fnm/volta case this launcher exists for. Here the notices
+    // must name the absolute path, or the command Claude runs fails with the same
+    // `node: command not found` the launcher just worked around. VOLTA_HOME drives one
+    // of the real search locations. PATH keeps everything except the directories that
+    // actually hold a node — emptying it outright would leave the shell itself unfindable
+    // and prove nothing.
+    const pathWithoutNode = (process.env.PATH || "")
+      .split(path.delimiter)
+      .filter((dir) => dir && !["node", "node.exe"].some((n) => fs.existsSync(path.join(dir, n))))
+      .join(path.delimiter);
+    const voltaHome = path.join(tmpDir, "volta");
+    const voltaNode = writeFakeNode(path.join(voltaHome, "bin"));
+    // Slashes normalised: the launcher composes "$VOLTA_HOME/bin/node" with forward
+    // slashes while path.join uses the platform separator. Same file either way.
+    const slashes = (p) => p.split("\\").join("/");
+    assert.strictEqual(
+      slashes(handOff({ ...process.env, PATH: pathWithoutNode, VOLTA_HOME: voltaHome })),
+      slashes(voltaNode),
+      "a node found off PATH must be exported for the notices to name",
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------------------

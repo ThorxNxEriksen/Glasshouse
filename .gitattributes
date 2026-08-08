@@ -1,0 +1,4 @@
+# glasshouse.sh is executed by `sh`, and a CRLF checkout breaks it on every line
+# ($'\r': command not found). Windows clones would otherwise get CRLF from
+# core.autocrlf, and the plugin is distributed by git clone into the plugin cache.
+*.sh text eol=lf
