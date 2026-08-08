@@ -239,6 +239,9 @@ session. Confirm the marketplace registers, the plugin installs, `/reload-plugin
 activates it, and exactly **one** row per event lands. Restore the `install.mjs`
 hooks afterwards.
 
-Also unverified: `git_branch` on desktop should name the session's worktree
-branch. It is not exposed in any `public_*` view, so checking it needs the
-Supabase MCP or direct table access, not the dashboard.
+`git_branch` is verified: a desktop session reported `pwd` as
+`/c/dev/glasshouse/.claude/worktrees/git-branch-verification-98a2db` on branch
+`claude/git-branch-verification-98a2db`, which is the command `gitBranch()` runs
+and the value it stores. Its events landed under `repo_name` `Glasshouse`, so the
+origin-remote key collapses the worktree as intended. The column itself is in no
+`public_*` view, so reading it back needs direct table access.
